@@ -1062,8 +1062,20 @@ def afficher_page_analyse_couts(df_transactions: pd.DataFrame, df_vehicules: pd.
         st.plotly_chart(fig_trend_prix_l, use_container_width=True)
 
         st.subheader("Transactions les Plus Coûteuses")
-        top_transactions = df_transactions.nlargest(10, 'Amount')[['Date', 'Hour', 'Card num.', 'Nouveau Immat', 'Catégorie', 'Quantity', 'Amount', 'Place']].merge(df_vehicules[['N° Carte', 'Nouveau Immat', 'Catégorie']], left_on='Card num.', right_on='N° Carte', how='left')
-        afficher_dataframe_avec_export(top_transactions[['Date', 'Hour', 'Nouveau Immat_x', 'Catégorie_x', 'Quantity', 'Amount', 'Place']], "Top 10 Transactions par Montant", key="top_transac_amount")
+        # 1. Get top 10 transactions by Amount
+        top_trans_base = df_transactions.nlargest(10, 'Amount')
+        # 2. Merge with vehicle info
+        top_transactions_merged = top_trans_base.merge(
+            df_vehicules[['N° Carte', 'Nouveau Immat', 'Catégorie']],
+            left_on='Card num.',
+            right_on='N° Carte',
+            how='left'
+        )
+        # 3. Select columns for display
+        cols_to_display_top = ['Date', 'Hour', 'Nouveau Immat', 'Catégorie', 'Quantity', 'Amount', 'Place', 'Card num.']
+        # Keep only existing columns to avoid errors if merge failed or columns missing
+        cols_final_top = [col for col in cols_to_display_top if col in top_transactions_merged.columns]
+        afficher_dataframe_avec_export(top_transactions_merged[cols_final_top], "Top 10 Transactions par Montant", key="top_transac_amount")
 
 
     with tab3:
@@ -1130,7 +1142,8 @@ def afficher_page_anomalies(df_transactions: pd.DataFrame, df_vehicules: pd.Data
             details_suspects = df_anomalies[df_anomalies['Card num.'].isin(vehicules_suspects['Card num.'])]
             cols_display_detail = ['Date', 'Hour', 'Nouveau Immat', 'Catégorie', 'type_anomalie', 'detail_anomalie', 'Quantity', 'Amount', 'Place', 'poids_anomalie']
             cols_final_detail = [col for col in cols_display_detail if col in details_suspects.columns]
-            afficher_dataframe_avec_export(details_suspects[cols_final_detail].sort_values(by=['Nouveau Immat', 'DateTime']), "Détail Transactions des Suspects", key="anom_suspects_details_transac")
+            # Remove redundant sort, data is already sorted by detecter_anomalies
+            afficher_dataframe_avec_export(details_suspects[cols_final_detail], "Détail Transactions des Suspects", key="anom_suspects_details_transac")
     else:
         st.info("Aucun véhicule n'atteint le seuil de score de risque suspect.")
 
