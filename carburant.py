@@ -699,94 +699,401 @@ def calculer_score_risque(df_anomalies: pd.DataFrame) -> pd.DataFrame:
 
     return summary.sort_values('score_risque', ascending=False)
 
+# ---------------------------------------------------------------------
+# NOUVELLE FONCTION : Analyse consommation par période
+# ---------------------------------------------------------------------
+def analyser_consommation_par_periode(
+    df_transactions: pd.DataFrame, 
+    df_vehicules: pd.DataFrame, 
+    date_debut: datetime.date, 
+    date_fin: datetime.date, 
+    periode: str = 'M', 
+    selected_categories: List[str] = None,
+    selected_vehicles: List[str] = None
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Analyse la consommation de carburant par période (jour, semaine, mois, trimestre, année)
+    
+    Args:
+        df_transactions: DataFrame des transactions
+        df_vehicules: DataFrame des véhicules
+        date_debut: Date de début de l'analyse
+        date_fin: Date de fin de l'analyse
+        periode: Période d'analyse ('D'=jour, 'W'=semaine, 'M'=mois, 'Q'=trimestre, 'Y'=année)
+        selected_categories: Liste des catégories à inclure (None = toutes)
+        selected_vehicles: Liste des véhicules à inclure (None = tous)
+        
+    Returns:
+        Tuple contenant:
+            - DataFrame des consommations moyennes par période
+            - DataFrame des consommations par véhicule et par période
+    """
+    # Fusionner les données de transactions avec les infos véhicules
+    df = df_transactions.merge(
+        df_vehicules[['N° Carte', 'Catégorie', 'Nouveau Immat', 'Cap-rèservoir']],
+        left_on='Card num.', right_on='N° Carte', how='left'
+    )
+    
+    # Filtrage date
+    mask_date = (df['Date'].dt.date >= date_debut) & (df['Date'].dt.date <= date_fin)
+    df = df[mask_date].copy()
+    
+    # Filtrage catégorie si spécifié
+    if selected_categories:
+        df = df[df['Catégorie'].isin(selected_categories)]
+        
+    # Filtrage véhicule si spécifié
+    if selected_vehicles:
+        df = df[df['Nouveau Immat'].isin(selected_vehicles)]
+    
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    
+    # Ajouter les informations nécessaires pour l'analyse
+    df['distance_parcourue'] = df['Current mileage'] - df['Past mileage']
+    df['consommation_100km'] = np.where(
+        (df['distance_parcourue'] > 0) & df['Quantity'].notna(),
+        (df['Quantity'] / df['distance_parcourue']) * 100,
+        np.nan
+    )
+    
+    # Récupérer les seuils par catégorie
+    seuils_conso = st.session_state.get('ss_conso_seuils_par_categorie', {})
+    
+    # Ajouter colonne pour la période et formatage
+    df['periode_datetime'] = df['Date'].dt.to_period(periode).dt.to_timestamp()
+    
+    if periode == 'D':
+        df['periode_str'] = df['Date'].dt.strftime('%Y-%m-%d')
+        format_periode = "Journalière"
+    elif periode == 'W':
+        df['periode_str'] = df['Date'].dt.to_period('W').astype(str)
+        format_periode = "Hebdomadaire"
+    elif periode == 'M':
+        df['periode_str'] = df['Date'].dt.strftime('%Y-%m')
+        format_periode = "Mensuelle"
+    elif periode == 'Q':
+        df['periode_str'] = df['Date'].dt.to_period('Q').astype(str)
+        format_periode = "Trimestrielle"
+    else:  # 'Y'
+        df['periode_str'] = df['Date'].dt.strftime('%Y')
+        format_periode = "Annuelle"
+    
+    # Analyser la consommation par véhicule et par période
+    conso_veh_periode = df.groupby(['Nouveau Immat', 'Catégorie', 'periode_str']).agg(
+        volume_total=('Quantity', 'sum'),
+        cout_total=('Amount', 'sum'),
+        distance_totale=('distance_parcourue', lambda x: x[x > 0].sum()),  # Ne prendre que les distances positives
+        nb_transactions=('Quantity', 'count'),
+        date_debut_periode=('Date', 'min'),
+        date_fin_periode=('Date', 'max')
+    ).reset_index()
+    
+    # Calculer la consommation moyenne par période pour chaque véhicule
+    conso_veh_periode['consommation_moyenne'] = np.where(
+        conso_veh_periode['distance_totale'] > 0,
+        (conso_veh_periode['volume_total'] / conso_veh_periode['distance_totale']) * 100,
+        np.nan
+    )
+    
+    # Ajouter le seuil correspondant à chaque catégorie
+    conso_veh_periode['seuil_consommation'] = conso_veh_periode['Catégorie'].map(
+        lambda x: seuils_conso.get(x, DEFAULT_CONSO_SEUIL)
+    )
+    
+    # Ajouter un indicateur d'excès de consommation
+    conso_veh_periode['exces_consommation'] = np.where(
+        conso_veh_periode['consommation_moyenne'] > conso_veh_periode['seuil_consommation'],
+        conso_veh_periode['consommation_moyenne'] - conso_veh_periode['seuil_consommation'],
+        0
+    )
+    
+    # Ajouter pourcentage d'excès
+    conso_veh_periode['pourcentage_exces'] = np.where(
+        conso_veh_periode['seuil_consommation'] > 0,
+        (conso_veh_periode['exces_consommation'] / conso_veh_periode['seuil_consommation']) * 100,
+        0
+    )
+    
+    # Agréger par période pour toutes catégories/véhicules
+    conso_periode = df.groupby(['periode_str']).agg(
+        volume_total=('Quantity', 'sum'),
+        cout_total=('Amount', 'sum'),
+        distance_totale=('distance_parcourue', lambda x: x[x > 0].sum()),
+        nb_transactions=('Quantity', 'count'),
+        nb_vehicules=('Nouveau Immat', 'nunique'),
+        date_debut_periode=('Date', 'min'),
+        date_fin_periode=('Date', 'max')
+    ).reset_index()
+    
+    # Calculer la consommation moyenne globale par période
+    conso_periode['consommation_moyenne'] = np.where(
+        conso_periode['distance_totale'] > 0,
+        (conso_periode['volume_total'] / conso_periode['distance_totale']) * 100,
+        np.nan
+    )
+    
+    # Arrondir les résultats
+    conso_veh_periode = conso_veh_periode.round({
+        'volume_total': 1,
+        'cout_total': 0,
+        'distance_totale': 0,
+        'consommation_moyenne': 1,
+        'exces_consommation': 1,
+        'pourcentage_exces': 1
+    })
+    
+    conso_periode = conso_periode.round({
+        'volume_total': 1,
+        'cout_total': 0,
+        'distance_totale': 0,
+        'consommation_moyenne': 1
+    })
+    
+    # Trier par période puis par excès de consommation
+    conso_veh_periode = conso_veh_periode.sort_values(['periode_str', 'exces_consommation'], ascending=[True, False])
+    conso_periode = conso_periode.sort_values('periode_str')
+    
+    return conso_periode, conso_veh_periode
 
 # ---------------------------------------------------------------------
-# Application Principale Streamlit
+# NOUVELLE FONCTION : Amélioration du dashboard
 # ---------------------------------------------------------------------
-def main():
-    st.title("📊 Gestion & Analyse Cartes Carburant")
+def ameliorer_dashboard(df_transactions: pd.DataFrame, df_vehicules: pd.DataFrame, global_date_debut: datetime.date, global_date_fin: datetime.date, kpi_cat_dash: pd.DataFrame, df_vehicle_kpi_dash: pd.DataFrame):
+    """Ajoute une section d'aperçu des excès de consommation au tableau de bord"""
+    
+    with st.expander("⚠️ Aperçu des Excès de Consommation (Mensuel)", expanded=True):
+        # Calculer les excès de consommation pour le dernier mois
+        _, conso_veh_mois = analyser_consommation_par_periode(
+            df_transactions, df_vehicules, global_date_debut, global_date_fin, 
+            periode='M', selected_categories=None, selected_vehicles=None
+        )
+        
+        if not conso_veh_mois.empty:
+            # Filtrer seulement les excès
+            exces_mois = conso_veh_mois[conso_veh_mois['exces_consommation'] > 0]
+            if not exces_mois.empty:
+                nb_exces_mois = len(exces_mois)
+                nb_vehicules_exces = exces_mois['Nouveau Immat'].nunique()
+                
+                col_e1, col_e2, col_e3 = st.columns(3)
+                col_e1.metric("Nombre d'Excès Détectés", f"{nb_exces_mois}")
+                col_e2.metric("Véhicules Concernés", f"{nb_vehicules_exces}")
+                col_e3.metric("Excès Moyen", f"{exces_mois['pourcentage_exces'].mean():.1f}%")
+                
+                # Top 5 des véhicules avec excès
+                top_exces = exces_mois.nlargest(5, 'pourcentage_exces')
+                top_exces_display = top_exces[[
+                    'periode_str', 'Nouveau Immat', 'consommation_moyenne',
+                    'seuil_consommation', 'pourcentage_exces'
+                ]]
+                top_exces_display.columns = [
+                    'Période', 'Immatriculation', 'Consommation (L/100km)', 
+                    'Seuil (L/100km)', 'Excès (%)'
+                ]
+                
+                st.dataframe(top_exces_display, use_container_width=True)
+                
+                st.markdown("""
+                👉 *Pour une analyse complète des excès de consommation, utilisez la page "Analyse par Période"*
+                """)
+            else:
+                st.success("✅ Aucun excès de consommation détecté pour les périodes analysées.")
+        else:
+            st.info("Données insuffisantes pour l'analyse des excès de consommation.")
 
-    # --- Chargement Fichiers ---
-    st.sidebar.header("1. Chargement des Données")
-    fichier_transactions = st.sidebar.file_uploader("Fichier Transactions (CSV)", type=['csv'])
-    fichier_cartes = st.sidebar.file_uploader("Fichier Cartes (Excel)", type=['xlsx', 'xls'])
-
-    if not fichier_transactions or not fichier_cartes:
-        st.info("👋 Bienvenue ! Veuillez charger le fichier des transactions (CSV) et le fichier des cartes (Excel) via la barre latérale pour commencer.")
-        initialize_session_state() # Initialiser même sans données pour afficher les paramètres
-        # Afficher la page des paramètres même sans données chargées
-        if st.sidebar.radio("Navigation", ["Paramètres"], index=0) == "Paramètres":
-            afficher_page_parametres()
+# ---------------------------------------------------------------------
+# NOUVELLE FONCTION : Affichage de la page d'analyse par période
+# ---------------------------------------------------------------------
+def afficher_page_analyse_periodes(df_transactions: pd.DataFrame, df_vehicules: pd.DataFrame, date_debut: datetime.date, date_fin: datetime.date):
+    """Affiche la page d'analyse de consommation par période."""
+    st.header(f"📅 Analyse de Consommation par Période ({date_debut.strftime('%d/%m/%Y')} - {date_fin.strftime('%d/%m/%Y')})")
+    
+    if df_transactions.empty:
+        st.warning("Aucune transaction à analyser pour la période sélectionnée.")
         return
-
-    # --- Chargement et Nettoyage ---
-    df_transactions, df_vehicules, df_ge, df_autres = charger_donnees(fichier_transactions, fichier_cartes)
-
-    # --- Vérification Post-Chargement ---
-    if df_transactions is None or df_vehicules is None or df_ge is None or df_autres is None:
-        st.error("❌ Erreur lors du chargement ou de la validation des fichiers. Veuillez vérifier les fichiers et les colonnes requises.")
-        st.session_state['data_loaded'] = False
-        return # Arrêter si le chargement échoue
-
-    st.session_state['data_loaded'] = True
-    st.sidebar.success("✅ Données chargées avec succès !")
-    min_date, max_date = df_transactions['Date'].min(), df_transactions['Date'].max()
-    st.sidebar.markdown(f"**Transactions :** {len(df_transactions):,}")
-    st.sidebar.markdown(f"**Période :** {min_date.strftime('%d/%m/%Y')} - {max_date.strftime('%d/%m/%Y')}")
-
-    # --- Initialisation dynamique de session_state (après chargement) ---
-    initialize_session_state(df_vehicules)
-
-    # --- Sélection Période Globale (optionnel, peut être par page) ---
-    st.sidebar.header("2. Période d'Analyse Globale")
-    col_date1, col_date2 = st.sidebar.columns(2)
-    global_date_debut = col_date1.date_input("Date Début", min_date.date(), min_value=min_date.date(), max_value=max_date.date(), key="global_date_debut")
-    global_date_fin = col_date2.date_input("Date Fin", max_date.date(), min_value=min_date.date(), max_value=max_date.date(), key="global_date_fin")
-
-    if global_date_debut > global_date_fin:
-        st.sidebar.error("La date de début ne peut pas être postérieure à la date de fin.")
+    
+    # --- Sélection de la période d'analyse ---
+    st.subheader("Configuration de l'Analyse")
+    col_config1, col_config2 = st.columns(2)
+    
+    with col_config1:
+        periode_options = {
+            'Jour': 'D',
+            'Semaine': 'W',
+            'Mois': 'M',
+            'Trimestre': 'Q',
+            'Année': 'Y'
+        }
+        periode_label = st.selectbox(
+            "Sélectionner la période d'analyse :",
+            options=list(periode_options.keys()),
+            index=2  # Mois par défaut
+        )
+        periode_code = periode_options[periode_label]
+    
+    with col_config2:
+        # Sélection des catégories
+        all_cats = sorted(df_vehicules['Catégorie'].dropna().astype(str).unique())
+        selected_cats = st.multiselect(
+            "Filtrer par Catégories de véhicules",
+            options=all_cats,
+            default=all_cats,
+            key="periode_cat_filter"
+        )
+    
+    # Option pour sélectionner des véhicules spécifiques
+    with st.expander("Filtrer par véhicules spécifiques (optionnel)"):
+        # Créer une liste filtrée de véhicules si des catégories sont sélectionnées
+        if selected_cats:
+            available_vehicles = sorted(df_vehicules[df_vehicules['Catégorie'].isin(selected_cats)]['Nouveau Immat'].dropna().unique())
+        else:
+            available_vehicles = sorted(df_vehicules['Nouveau Immat'].dropna().unique())
+        
+        selected_vehicles = st.multiselect(
+            "Sélectionner des véhicules spécifiques",
+            options=available_vehicles,
+            default=None,
+            key="periode_veh_filter"
+        )
+    
+    # --- Analyse et affichage des résultats ---
+    with st.spinner(f"Analyse {periode_label.lower()} en cours..."):
+        conso_periode, conso_veh_periode = analyser_consommation_par_periode(
+            df_transactions, df_vehicules, date_debut, date_fin, 
+            periode=periode_code, selected_categories=selected_cats, 
+            selected_vehicles=selected_vehicles if selected_vehicles else None
+        )
+    
+    if conso_periode.empty or conso_veh_periode.empty:
+        st.warning(f"Données insuffisantes pour l'analyse {periode_label.lower()}.")
         return
-
-    # Filtrer les données principales une seule fois pour la période globale
-    mask_global_date = (df_transactions['Date'].dt.date >= global_date_debut) & (df_transactions['Date'].dt.date <= global_date_fin)
-    df_transac_filtered = df_transactions[mask_global_date].copy()
-
-    if df_transac_filtered.empty:
-         st.warning("Aucune transaction trouvée pour la période sélectionnée.")
-         # Permettre la navigation même sans données filtrées
+    
+    # --- Vue globale par période ---
+    st.subheader(f"Consommation {periode_label} Globale")
+    
+    # Afficher le tableau récapitulatif par période
+    afficher_dataframe_avec_export(
+        conso_periode[['periode_str', 'volume_total', 'cout_total', 'distance_totale', 
+                      'consommation_moyenne', 'nb_transactions', 'nb_vehicules']],
+        f"Récapitulatif {periode_label}",
+        key=f"recap_periode_{periode_code}"
+    )
+    
+    # Graphique d'évolution de la consommation moyenne par période
+    fig_conso = px.line(
+        conso_periode, x='periode_str', y='consommation_moyenne',
+        title=f"Évolution de la Consommation Moyenne ({periode_label})",
+        labels={'periode_str': periode_label, 'consommation_moyenne': 'Conso. Moyenne (L/100km)'},
+        markers=True
+    )
+    
+    # Ajouter une ligne horizontale pour la moyenne globale
+    conso_moy_globale = conso_periode['consommation_moyenne'].mean()
+    fig_conso.add_hline(
+        y=conso_moy_globale,
+        line_dash="dash", line_color="green",
+        annotation_text=f"Moyenne: {conso_moy_globale:.1f} L/100km"
+    )
+    
+    st.plotly_chart(fig_conso, use_container_width=True)
+    
+    # Graphique d'évolution du volume/coût par période
+    fig_vol_cout = px.bar(
+        conso_periode, x='periode_str', y=['volume_total', 'cout_total'],
+        title=f"Volume et Coût par {periode_label}",
+        labels={'periode_str': periode_label, 'value': 'Valeur', 'variable': 'Métrique'},
+        barmode='group'
+    )
+    st.plotly_chart(fig_vol_cout, use_container_width=True)
+    
+    # --- Vue détaillée par véhicule et période ---
+    st.subheader(f"Détail par Véhicule et par {periode_label}")
+    
+    # Détection des excès de consommation
+    exces_veh = conso_veh_periode[conso_veh_periode['exces_consommation'] > 0]
+    nb_exces = len(exces_veh)
+    
+    if nb_exces > 0:
+        st.warning(f"⚠️ Détecté : {nb_exces} cas d'excès de consommation sur la période.")
+        
+        # Tableau des excès de consommation
+        cols_display_exces = [
+            'periode_str', 'Nouveau Immat', 'Catégorie', 'consommation_moyenne',
+            'seuil_consommation', 'exces_consommation', 'pourcentage_exces',
+            'volume_total', 'distance_totale', 'nb_transactions'
+        ]
+        
+        afficher_dataframe_avec_export(
+            exces_veh[cols_display_exces],
+            "Excès de Consommation Détectés",
+            key=f"exces_conso_{periode_code}"
+        )
+        
+        # Graphique des plus grands excès
+        top_exces = exces_veh.nlargest(10, 'pourcentage_exces')
+        fig_top_exces = px.bar(
+            top_exces,
+            x='Nouveau Immat',
+            y='pourcentage_exces',
+            color='Catégorie',
+            title="Top 10 des Excès de Consommation (%)",
+            labels={'pourcentage_exces': "Excès (%)", 'Nouveau Immat': 'Véhicule'},
+            hover_data=['periode_str', 'consommation_moyenne', 'seuil_consommation']
+        )
+        st.plotly_chart(fig_top_exces, use_container_width=True)
     else:
-         st.sidebar.info(f"{len(df_transac_filtered):,} transactions dans la période sélectionnée.")
-
-
-    # --- Navigation ---
-    st.sidebar.header("3. Navigation")
-    pages = ["Tableau de Bord", "Analyse Véhicules", "Analyse des Coûts", "Anomalies", "KPIs", "Autres Cartes", "Paramètres"]
-    if not df_transac_filtered.empty:
-         page = st.sidebar.radio("Choisir une page :", pages, key="navigation")
-    else: # Si pas de données filtrées, limiter les pages accessibles
-         page = st.sidebar.radio("Choisir une page :", ["Tableau de Bord", "Autres Cartes", "Paramètres"], key="navigation_limited")
-
-
-    # --- Contenu des Pages ---
-    if page == "Tableau de Bord":
-        afficher_page_dashboard(df_transac_filtered, df_vehicules, df_ge, df_autres, global_date_debut, global_date_fin)
-    elif page == "Analyse Véhicules":
-         # Recalculer les KPI ici pour avoir la conso moyenne catégorie à jour
-         kpi_cat_dashboard, df_vehicle_kpi_dashboard = calculer_kpis_globaux(
-             df_transac_filtered, df_vehicules, global_date_debut, global_date_fin,
-             list(st.session_state.ss_conso_seuils_par_categorie.keys()) # Toutes catégories
-         )
-         afficher_page_analyse_vehicules(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin, kpi_cat_dashboard)
-    elif page == "Analyse des Coûts":
-         afficher_page_analyse_couts(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin)
-    elif page == "Anomalies":
-        afficher_page_anomalies(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin)
-    elif page == "KPIs":
-        afficher_page_kpi(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin)
-    elif page == "Autres Cartes":
-        afficher_page_autres_cartes(df_transac_filtered, df_autres, global_date_debut, global_date_fin)
-    elif page == "Paramètres":
-        afficher_page_parametres(df_vehicules) # Passer df_vehicules pour MAJ catégories
+        st.success("✅ Aucun excès de consommation détecté sur la période analysée.")
+    
+    # Vue détaillée de toutes les données par véhicule et période
+    with st.expander("Voir toutes les données détaillées par véhicule et période"):
+        cols_display_detail = [
+            'periode_str', 'Nouveau Immat', 'Catégorie', 'volume_total',
+            'distance_totale', 'consommation_moyenne', 'seuil_consommation',
+            'exces_consommation', 'pourcentage_exces', 'cout_total', 'nb_transactions'
+        ]
+        
+        afficher_dataframe_avec_export(
+            conso_veh_periode[cols_display_detail],
+            f"Toutes les données par Véhicule et {periode_label}",
+            key=f"all_data_periode_{periode_code}"
+        )
+    
+    # --- Analyse comparative inter-périodes ---
+    with st.expander("Analyse comparative entre périodes", expanded=False):
+        st.info("Cette section permet de visualiser l'évolution de la consommation par véhicule à travers les périodes.")
+        
+        # Sélectionner un véhicule pour l'analyse détaillée
+        vehicules_list = sorted(conso_veh_periode['Nouveau Immat'].unique())
+        if vehicules_list:
+            vehicule_selected = st.selectbox(
+                "Sélectionner un véhicule pour l'analyse détaillée :",
+                options=vehicules_list,
+                key="compare_vehicule_select"
+            )
+            
+            # Filtrer les données pour ce véhicule
+            veh_data = conso_veh_periode[conso_veh_periode['Nouveau Immat'] == vehicule_selected]
+            
+            if not veh_data.empty:
+                # Graphique d'évolution de la consommation pour ce véhicule
+                fig_veh_evo = px.line(
+                    veh_data, x='periode_str', y=['consommation_moyenne', 'seuil_consommation'],
+                    title=f"Évolution de la Consommation - {vehicule_selected}",
+                    labels={'periode_str': periode_label, 'value': 'Consommation (L/100km)', 'variable': 'Métrique'},
+                    markers=True
+                )
+                st.plotly_chart(fig_veh_evo, use_container_width=True)
+                
+                # Tableau d'évolution
+                st.dataframe(veh_data[[
+                    'periode_str', 'consommation_moyenne', 'seuil_consommation',
+                    'exces_consommation', 'volume_total', 'distance_totale'
+                ]], use_container_width=True)
+            else:
+                st.info(f"Pas de données disponibles pour {vehicule_selected} sur les périodes sélectionnées.")
+        else:
+            st.info("Aucun véhicule avec données suffisantes pour l'analyse comparative.")
 
 # ---------------------------------------------------------------------
 # Fonctions d'Affichage des Pages
@@ -1382,7 +1689,109 @@ def afficher_page_parametres(df_vehicules: Optional[pd.DataFrame] = None):
 
 
 # ---------------------------------------------------------------------
-# Point d'entrée
+# Point d'entrée avec navigation mise à jour
+# ---------------------------------------------------------------------
+def main():
+    st.title("📊 Gestion & Analyse Cartes Carburant")
+
+    # --- Chargement Fichiers ---
+    st.sidebar.header("1. Chargement des Données")
+    fichier_transactions = st.sidebar.file_uploader("Fichier Transactions (CSV)", type=['csv'])
+    fichier_cartes = st.sidebar.file_uploader("Fichier Cartes (Excel)", type=['xlsx', 'xls'])
+
+    if not fichier_transactions or not fichier_cartes:
+        st.info("👋 Bienvenue ! Veuillez charger le fichier des transactions (CSV) et le fichier des cartes (Excel) via la barre latérale pour commencer.")
+        initialize_session_state() # Initialiser même sans données pour afficher les paramètres
+        # Afficher la page des paramètres même sans données chargées
+        if st.sidebar.radio("Navigation", ["Paramètres"], index=0) == "Paramètres":
+            afficher_page_parametres()
+        return
+
+    # --- Chargement et Nettoyage ---
+    df_transactions, df_vehicules, df_ge, df_autres = charger_donnees(fichier_transactions, fichier_cartes)
+
+    # --- Vérification Post-Chargement ---
+    if df_transactions is None or df_vehicules is None or df_ge is None or df_autres is None:
+        st.error("❌ Erreur lors du chargement ou de la validation des fichiers. Veuillez vérifier les fichiers et les colonnes requises.")
+        st.session_state['data_loaded'] = False
+        return # Arrêter si le chargement échoue
+
+    st.session_state['data_loaded'] = True
+    st.sidebar.success("✅ Données chargées avec succès !")
+    min_date, max_date = df_transactions['Date'].min(), df_transactions['Date'].max()
+    st.sidebar.markdown(f"**Transactions :** {len(df_transactions):,}")
+    st.sidebar.markdown(f"**Période :** {min_date.strftime('%d/%m/%Y')} - {max_date.strftime('%d/%m/%Y')}")
+
+    # --- Initialisation dynamique de session_state (après chargement) ---
+    initialize_session_state(df_vehicules)
+
+    # --- Sélection Période Globale (optionnel, peut être par page) ---
+    st.sidebar.header("2. Période d'Analyse Globale")
+    col_date1, col_date2 = st.sidebar.columns(2)
+    global_date_debut = col_date1.date_input("Date Début", min_date.date(), min_value=min_date.date(), max_value=max_date.date(), key="global_date_debut")
+    global_date_fin = col_date2.date_input("Date Fin", max_date.date(), min_value=min_date.date(), max_value=max_date.date(), key="global_date_fin")
+
+    if global_date_debut > global_date_fin:
+        st.sidebar.error("La date de début ne peut pas être postérieure à la date de fin.")
+        return
+
+    # Filtrer les données principales une seule fois pour la période globale
+    mask_global_date = (df_transactions['Date'].dt.date >= global_date_debut) & (df_transactions['Date'].dt.date <= global_date_fin)
+    df_transac_filtered = df_transactions[mask_global_date].copy()
+
+    if df_transac_filtered.empty:
+         st.warning("Aucune transaction trouvée pour la période sélectionnée.")
+         # Permettre la navigation même sans données filtrées
+    else:
+         st.sidebar.info(f"{len(df_transac_filtered):,} transactions dans la période sélectionnée.")
+
+
+    # --- Navigation avec la nouvelle page "Analyse par Période" ---
+    st.sidebar.header("3. Navigation")
+    pages = [
+        "Tableau de Bord", "Analyse Véhicules", "Analyse des Coûts", 
+        "Analyse par Période", "Anomalies", "KPIs", "Autres Cartes", "Paramètres"
+    ]
+    if not df_transac_filtered.empty:
+         page = st.sidebar.radio("Choisir une page :", pages, key="navigation")
+    else: # Si pas de données filtrées, limiter les pages accessibles
+         page = st.sidebar.radio("Choisir une page :", ["Tableau de Bord", "Autres Cartes", "Paramètres"], key="navigation_limited")
+
+
+    # --- Contenu des Pages ---
+    if page == "Tableau de Bord":
+        # Recalculer les KPI ici pour avoir la conso moyenne catégorie à jour
+        kpi_cat_dashboard, df_vehicle_kpi_dashboard = calculer_kpis_globaux(
+            df_transac_filtered, df_vehicules, global_date_debut, global_date_fin,
+            list(st.session_state.ss_conso_seuils_par_categorie.keys()) # Toutes catégories
+        )
+        afficher_page_dashboard(df_transac_filtered, df_vehicules, df_ge, df_autres, global_date_debut, global_date_fin)
+        # Ajouter l'amélioration du dashboard
+        ameliorer_dashboard(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin, 
+                        kpi_cat_dashboard, df_vehicle_kpi_dashboard)
+    elif page == "Analyse Véhicules":
+         # Recalculer les KPI ici pour avoir la conso moyenne catégorie à jour
+         kpi_cat_dashboard, df_vehicle_kpi_dashboard = calculer_kpis_globaux(
+             df_transac_filtered, df_vehicules, global_date_debut, global_date_fin,
+             list(st.session_state.ss_conso_seuils_par_categorie.keys()) # Toutes catégories
+         )
+         afficher_page_analyse_vehicules(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin, kpi_cat_dashboard)
+    elif page == "Analyse des Coûts":
+         afficher_page_analyse_couts(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin)
+    elif page == "Analyse par Période":
+         afficher_page_analyse_periodes(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin)
+    elif page == "Anomalies":
+        afficher_page_anomalies(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin)
+    elif page == "KPIs":
+        afficher_page_kpi(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin)
+    elif page == "Autres Cartes":
+        afficher_page_autres_cartes(df_transac_filtered, df_autres, global_date_debut, global_date_fin)
+    elif page == "Paramètres":
+        afficher_page_parametres(df_vehicules) # Passer df_vehicules pour MAJ catégories
+
+
+# ---------------------------------------------------------------------
+# Exécution de l'application
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
     main()
