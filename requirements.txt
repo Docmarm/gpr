@@ -1,6 +1,7 @@
 streamlit
 pandas
-plotly
 numpy
-PyPDF2
+plotly
 openpyxl
+python-dateutil
+PyPDF2
