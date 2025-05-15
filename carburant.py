@@ -15,7 +15,6 @@ from streamlit_folium import folium_static
 from PIL import Image
 import base64
 from io import BytesIO
-from afficher_page_analyse_vehicules import afficher_page_analyse_vehicules
 
 # ---------------------------------------------------------------------
 # Constantes et Utilitaires
