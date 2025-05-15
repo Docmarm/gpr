@@ -3715,7 +3715,6 @@ def afficher_page_parametres(df_vehicules: Optional[pd.DataFrame] = None):
 # Point d'entrée avec navigation mise à jour
 # ---------------------------------------------------------------------
 def main():
-    st.set_page_config(layout="wide") # Utiliser toute la largeur de la page
     st.title("📊 Gestion & Analyse Cartes Carburant")
 
     st.sidebar.header("1. Chargement des Données")
