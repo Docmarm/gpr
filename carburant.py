@@ -3176,8 +3176,8 @@ def detecter_anomalies_geolocalisation(
         for idx, row in trajets_suspects.iterrows():
             anomalie = {
                 'Véhicule': row['Véhicule'],
-                'Date': datetime.strptime(row['Date_Heure_Debut'].split()[0], '%d/%m/%Y').date(),
-                'Heure': row['Date_Heure_Debut'].split()[1] if ' ' in row['Date_Heure_Debut'] else None,
+                'Date': row['Date'].date() if pd.notna(row['Date']) else None,
+                'Heure': row['Début'] if pd.notna(row['Début']) else None,
                 'Type_Anomalie': 'Trajet suspect (géoloc)',
                 'Détail_Anomalie': row['Description_Suspicion'],
                 'Niveau_Anomalie': row['Niveau_Suspicion'],
