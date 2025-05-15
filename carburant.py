@@ -1652,7 +1652,7 @@ def detecter_trajets_suspects(
     
     # Sélectionner et ordonner les colonnes pertinentes
     cols_suspects = [
-        'Véhicule', 'Date_Heure_Debut', 'Distance', 'Durée_minutes', 'Vitesse moyenne',
+        'Véhicule', 'Date', 'Début', 'Date_Heure_Debut', 'Distance', 'Durée_minutes', 'Vitesse moyenne',
         'Description_Suspicion', 'Score_Suspicion_Total', 'Niveau_Suspicion'
     ]
     
