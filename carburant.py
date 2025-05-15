@@ -22,6 +22,11 @@ DEFAULT_HEURE_FIN_NON_OUVRE = 6
 DEFAULT_DELTA_MINUTES_FACTURATION_DOUBLE = 60
 DEFAULT_SEUIL_ANOMALIES_SUSPECTES_SCORE = 10 # Basé sur un score pondéré
 
+# --- Nouveaux seuils pour le suivi des dotations ---
+DEFAULT_SEUIL_SOUS_UTILISATION = 60  # Pourcentage en dessous duquel on considère une sous-utilisation
+DEFAULT_SEUIL_SUR_UTILISATION = 110  # Pourcentage au-dessus duquel on considère une sur-utilisation
+DEFAULT_MOIS_MIN_ANALYSE = 1  # Nombre minimum de mois pour l'analyse de tendance
+
 # --- Poids par défaut pour le score de risque ---
 DEFAULT_POIDS_CONSO_EXCESSIVE = 5
 DEFAULT_POIDS_DEPASSEMENT_CAPACITE = 10
@@ -54,6 +59,9 @@ def initialize_session_state(df_vehicules: Optional[pd.DataFrame] = None):
         'ss_poids_hors_service': DEFAULT_POIDS_HORS_SERVICE,
         'ss_poids_fact_double': DEFAULT_POIDS_FACT_DOUBLE,
         'ss_conso_seuils_par_categorie': {}, # Sera peuplé dynamiquement
+        'ss_seuil_sous_utilisation': DEFAULT_SEUIL_SOUS_UTILISATION,  # Nouveau seuil 
+        'ss_seuil_sur_utilisation': DEFAULT_SEUIL_SUR_UTILISATION,    # Nouveau seuil
+        'ss_mois_min_analyse': DEFAULT_MOIS_MIN_ANALYSE,              # Nouveau seuil
         'data_loaded': False # Indicateur de chargement des données
     }
     for key, value in defaults.items():
@@ -939,7 +947,7 @@ def afficher_page_analyse_periodes(df_transactions: pd.DataFrame, df_vehicules: 
             st.info("Aucun véhicule avec données suffisantes pour l'analyse comparative.")
 
 # ---------------------------------------------------------------------
-# NOUVELLES FONCTIONS POUR LE SUIVI DES DOTATIONS
+# FONCTIONS AMÉLIORÉES POUR LE SUIVI DES DOTATIONS
 # ---------------------------------------------------------------------
 def analyser_suivi_dotations(
     df_transactions_filtrees: pd.DataFrame,
@@ -981,7 +989,6 @@ def analyser_suivi_dotations(
     delta = relativedelta(date_fin_periode, date_debut_periode)
     nombre_mois_periode = delta.years * 12 + delta.months + 1
 
-
     # --- Analyse mensuelle détaillée ---
     df_merged['AnneeMois'] = df_merged['Date'].dt.strftime('%Y-%m')
     
@@ -999,9 +1006,31 @@ def analyser_suivi_dotations(
         (conso_mensuelle_veh['Consommation_Mois_L'] / conso_mensuelle_veh['Dotation_Mensuelle_L']) * 100,
         np.nan # ou 0 si consommation = 0, ou un grand nombre si consommation > 0 et dotation = 0
     )
+    
+    # Ajout de flags pour sous-utilisation et sur-utilisation
+    seuil_sous_utilisation = st.session_state.get('ss_seuil_sous_utilisation', DEFAULT_SEUIL_SOUS_UTILISATION)
+    seuil_sur_utilisation = st.session_state.get('ss_seuil_sur_utilisation', DEFAULT_SEUIL_SUR_UTILISATION)
+    
+    conso_mensuelle_veh['Statut_Utilisation'] = np.select(
+        [
+            conso_mensuelle_veh['Taux_Utilisation_Mois_%'] < seuil_sous_utilisation,
+            conso_mensuelle_veh['Taux_Utilisation_Mois_%'] > seuil_sur_utilisation,
+        ],
+        [
+            'Sous-utilisation',
+            'Sur-utilisation',
+        ],
+        default='Normal'
+    )
+    
+    conso_mensuelle_veh['Potentiel_Economie_L'] = np.where(
+        conso_mensuelle_veh['Statut_Utilisation'] == 'Sous-utilisation',
+        (conso_mensuelle_veh['Dotation_Mensuelle_L'] * (1 - (conso_mensuelle_veh['Taux_Utilisation_Mois_%'] / 100))).round(1),
+        0
+    )
+    
     conso_mensuelle_veh['Taux_Utilisation_Mois_%'] = conso_mensuelle_veh['Taux_Utilisation_Mois_%'].round(1)
-
-
+    
     # --- Récapitulatif par véhicule sur toute la période ---
     # Consommation totale sur la période par véhicule
     conso_totale_periode_veh = df_merged.groupby(['Nouveau Immat', 'Catégorie', 'Dotation']).agg(
@@ -1019,16 +1048,94 @@ def analyser_suivi_dotations(
         (conso_totale_periode_veh['Consommation_Reelle_Periode_L'] / conso_totale_periode_veh['Dotation_Allouee_Periode_L']) * 100,
         np.nan
     )
+    
+    # Ajout d'analyses supplémentaires pour l'optimisation des dotations
+    conso_totale_periode_veh['Statut_Utilisation'] = np.select(
+        [
+            conso_totale_periode_veh['Taux_Utilisation_Periode_%'] < seuil_sous_utilisation,
+            conso_totale_periode_veh['Taux_Utilisation_Periode_%'] > seuil_sur_utilisation,
+        ],
+        [
+            'Sous-utilisation',
+            'Sur-utilisation',
+        ],
+        default='Normal'
+    )
+    
+    # Calcul des économies potentielles en litres et pourcentage de réduction
+    conso_totale_periode_veh['Pourcentage_Inutilise'] = np.where(
+        conso_totale_periode_veh['Taux_Utilisation_Periode_%'] < 100,
+        100 - conso_totale_periode_veh['Taux_Utilisation_Periode_%'],
+        0
+    )
+    
+    # Nouvelles colonnes pour l'optimisation
+    conso_totale_periode_veh['Economie_Potentielle_L'] = np.where(
+        conso_totale_periode_veh['Statut_Utilisation'] == 'Sous-utilisation',
+        (conso_totale_periode_veh['Dotation_Mensuelle_L'] * 
+         (1 - (conso_totale_periode_veh['Taux_Utilisation_Periode_%'] / 100))).round(1),
+        0
+    )
+    
+    conso_totale_periode_veh['Dotation_Optimisee_L'] = np.where(
+        conso_totale_periode_veh['Statut_Utilisation'] == 'Sous-utilisation',
+        (conso_totale_periode_veh['Consommation_Reelle_Periode_L'] / nombre_mois_periode * 1.1).round(0),  # 10% de marge
+        conso_totale_periode_veh['Dotation_Mensuelle_L']
+    )
+    
+    conso_totale_periode_veh['Variation_Dotation_%'] = np.where(
+        conso_totale_periode_veh['Dotation_Mensuelle_L'] > 0,
+        ((conso_totale_periode_veh['Dotation_Optimisee_L'] / conso_totale_periode_veh['Dotation_Mensuelle_L']) * 100 - 100).round(1),
+        0
+    )
+    
+    # Arrondi des valeurs finales
     conso_totale_periode_veh['Taux_Utilisation_Periode_%'] = conso_totale_periode_veh['Taux_Utilisation_Periode_%'].round(1)
+    conso_totale_periode_veh['Pourcentage_Inutilise'] = conso_totale_periode_veh['Pourcentage_Inutilise'].round(1)
+    
+    # Joindre le nombre de mois où il y a sous-utilisation pour chaque véhicule
+    mois_sous_util = conso_mensuelle_veh[conso_mensuelle_veh['Statut_Utilisation'] == 'Sous-utilisation'].groupby('Nouveau Immat').size().reset_index(name='Nb_Mois_Sous_Utilisation')
+    conso_totale_periode_veh = conso_totale_periode_veh.merge(mois_sous_util, on='Nouveau Immat', how='left')
+    conso_totale_periode_veh['Nb_Mois_Sous_Utilisation'] = conso_totale_periode_veh['Nb_Mois_Sous_Utilisation'].fillna(0).astype(int)
+    
+    # Calcul du ratio de mois en sous-utilisation
+    conso_totale_periode_veh['Ratio_Mois_Sous_Util_%'] = (conso_totale_periode_veh['Nb_Mois_Sous_Utilisation'] / nombre_mois_periode * 100).round(1)
+    
+    # Recommandation basée sur l'analyse
+    conditions = [
+        (conso_totale_periode_veh['Statut_Utilisation'] == 'Sous-utilisation') & 
+        (conso_totale_periode_veh['Ratio_Mois_Sous_Util_%'] >= 70) &
+        (conso_totale_periode_veh['Pourcentage_Inutilise'] >= 30),
+        
+        (conso_totale_periode_veh['Statut_Utilisation'] == 'Sous-utilisation') & 
+        (conso_totale_periode_veh['Ratio_Mois_Sous_Util_%'] >= 50),
+        
+        (conso_totale_periode_veh['Statut_Utilisation'] == 'Sur-utilisation') &
+        (conso_totale_periode_veh['Taux_Utilisation_Periode_%'] > 120)
+    ]
+    
+    choix = [
+        'Forte réduction recommandée',
+        'Réduction possible',
+        'Augmentation recommandée'
+    ]
+    
+    conso_totale_periode_veh['Recommandation'] = np.select(conditions, choix, default='Maintenir')
 
     # Sélection et ordre des colonnes
     cols_recap = ['Nouveau Immat', 'Catégorie', 'Dotation_Mensuelle_L', 'Nb_Mois_Periode', 
                   'Dotation_Allouee_Periode_L', 'Consommation_Reelle_Periode_L', 
-                  'Difference_Periode_L', 'Taux_Utilisation_Periode_%']
+                  'Difference_Periode_L', 'Taux_Utilisation_Periode_%', 'Statut_Utilisation',
+                  'Nb_Mois_Sous_Utilisation', 'Ratio_Mois_Sous_Util_%',
+                  'Economie_Potentielle_L', 'Dotation_Optimisee_L', 
+                  'Variation_Dotation_%', 'Recommandation']
+    
     df_recap_dotation_periode = conso_totale_periode_veh[cols_recap]
 
     cols_detail = ['Nouveau Immat', 'Catégorie', 'AnneeMois', 'Dotation_Mensuelle_L', 
-                   'Consommation_Mois_L', 'Difference_Mois_L', 'Taux_Utilisation_Mois_%']
+                   'Consommation_Mois_L', 'Difference_Mois_L', 'Taux_Utilisation_Mois_%',
+                   'Statut_Utilisation', 'Potentiel_Economie_L']
+    
     df_detail_dotation_mensuel = conso_mensuelle_veh[cols_detail].sort_values(['Nouveau Immat', 'AnneeMois'])
     
     return df_recap_dotation_periode, df_detail_dotation_mensuel
@@ -1040,8 +1147,8 @@ def afficher_page_suivi_dotations(
     date_debut: datetime.date, 
     date_fin: datetime.date
 ):
-    """Affiche la page de suivi des dotations."""
-    st.header(f"⛽ Suivi des Dotations Carburant ({date_debut.strftime('%d/%m/%Y')} - {date_fin.strftime('%d/%m/%Y')})")
+    """Affiche la page de suivi des dotations améliorée avec focus sur l'optimisation."""
+    st.header(f"⛽ Suivi et Optimisation des Dotations ({date_debut.strftime('%d/%m/%Y')} - {date_fin.strftime('%d/%m/%Y')})")
 
     if 'Dotation' not in df_vehicules.columns or df_vehicules['Dotation'].sum() == 0:
         st.warning("Aucune donnée de dotation n'est disponible ou les dotations sont toutes à zéro. Le suivi des dotations ne peut pas être effectué.")
@@ -1052,6 +1159,29 @@ def afficher_page_suivi_dotations(
         st.warning("Aucune transaction à analyser pour la période sélectionnée.")
         return
 
+    # --- Configuration des paramètres de l'analyse ---
+    with st.sidebar.expander("⚙️ Paramètres d'analyse des dotations", expanded=False):
+        st.session_state.ss_seuil_sous_utilisation = st.slider(
+            "Seuil de sous-utilisation (%)", 
+            min_value=30, max_value=90, 
+            value=st.session_state.get('ss_seuil_sous_utilisation', DEFAULT_SEUIL_SOUS_UTILISATION),
+            step=5, help="Pourcentage en dessous duquel on considère qu'un véhicule sous-utilise sa dotation."
+        )
+        
+        st.session_state.ss_seuil_sur_utilisation = st.slider(
+            "Seuil de sur-utilisation (%)", 
+            min_value=100, max_value=150, 
+            value=st.session_state.get('ss_seuil_sur_utilisation', DEFAULT_SEUIL_SUR_UTILISATION),
+            step=5, help="Pourcentage au-dessus duquel on considère qu'un véhicule sur-utilise sa dotation."
+        )
+        
+        st.session_state.ss_mois_min_analyse = st.slider(
+            "Nombre minimum de mois pour l'analyse", 
+            min_value=1, max_value=6, 
+            value=st.session_state.get('ss_mois_min_analyse', DEFAULT_MOIS_MIN_ANALYSE),
+            step=1, help="Nombre minimum de mois requis pour une analyse fiable."
+        )
+
     # --- Filtres ---
     st.sidebar.subheader("Filtres pour Suivi Dotations")
     all_cats_dot = sorted(df_vehicules['Catégorie'].dropna().astype(str).unique())
@@ -1060,6 +1190,30 @@ def afficher_page_suivi_dotations(
     )
 
     vehicules_filtrables = df_vehicules[df_vehicules['Catégorie'].isin(selected_cats_dot)]['Nouveau Immat'].dropna().unique()
+    
+    filtre_statut_options = ["Tous", "Sous-utilisation", "Normal", "Sur-utilisation"]
+    filtre_statut = st.sidebar.selectbox(
+        "Filtrer par statut d'utilisation", 
+        options=filtre_statut_options, 
+        index=0,
+        key="dot_statut_filter"
+    )
+    
+    tri_options = {
+        "Taux d'utilisation (croissant)": ("Taux_Utilisation_Periode_%", True),
+        "Taux d'utilisation (décroissant)": ("Taux_Utilisation_Periode_%", False),
+        "Économie potentielle (décroissant)": ("Economie_Potentielle_L", False),
+        "Variation dotation (croissant)": ("Variation_Dotation_%", True),
+        "Alphabétique (immatriculation)": ("Nouveau Immat", True)
+    }
+    
+    option_tri = st.sidebar.selectbox(
+        "Trier les véhicules par", 
+        options=list(tri_options.keys()),
+        index=0,
+        key="dot_sort_option"
+    )
+    
     selected_vehicle_dot = st.sidebar.selectbox(
         "Choisir un véhicule spécifique (Optionnel)", 
         options=["Tous les véhicules"] + sorted(list(vehicules_filtrables)),
@@ -1078,53 +1232,399 @@ def afficher_page_suivi_dotations(
         
     # Appliquer les filtres post-analyse
     df_recap_filtered = df_recap[df_recap['Catégorie'].isin(selected_cats_dot)]
+    
+    if filtre_statut != "Tous":
+        df_recap_filtered = df_recap_filtered[df_recap_filtered['Statut_Utilisation'] == filtre_statut]
+    
+    # Appliquer le tri sélectionné
+    tri_col, tri_asc = tri_options[option_tri]
+    df_recap_filtered = df_recap_filtered.sort_values(by=tri_col, ascending=tri_asc)
+    
     if selected_vehicle_dot != "Tous les véhicules":
         df_recap_filtered = df_recap_filtered[df_recap_filtered['Nouveau Immat'] == selected_vehicle_dot]
         df_detail_mensuel_filtered = df_detail_mensuel[
             (df_detail_mensuel['Nouveau Immat'] == selected_vehicle_dot) &
-            (df_detail_mensuel['Catégorie'].isin(selected_cats_dot)) # Garder filtre catégorie aussi
+            (df_detail_mensuel['Catégorie'].isin(selected_cats_dot))
         ]
     else:
         df_detail_mensuel_filtered = df_detail_mensuel[df_detail_mensuel['Catégorie'].isin(selected_cats_dot)]
+        if filtre_statut != "Tous":
+            vehicules_statut = df_recap_filtered['Nouveau Immat'].unique()
+            df_detail_mensuel_filtered = df_detail_mensuel_filtered[
+                df_detail_mensuel_filtered['Nouveau Immat'].isin(vehicules_statut)
+            ]
 
+    # --- Indicateurs Clés ---
+    st.subheader("🔍 Aperçu Général des Dotations")
+    
+    # Calcul des principaux indicateurs
+    total_vehicules = len(df_recap_filtered)
+    total_dotation_mensuelle = df_recap_filtered['Dotation_Mensuelle_L'].sum()
+    total_consommation = df_recap_filtered['Consommation_Reelle_Periode_L'].sum()
+    total_dotation_periode = df_recap_filtered['Dotation_Allouee_Periode_L'].sum()
+    taux_utilisation_global = (total_consommation / total_dotation_periode * 100) if total_dotation_periode > 0 else 0
+    
+    # Nombre de véhicules par statut
+    nb_sous_util = len(df_recap_filtered[df_recap_filtered['Statut_Utilisation'] == 'Sous-utilisation'])
+    nb_normal = len(df_recap_filtered[df_recap_filtered['Statut_Utilisation'] == 'Normal'])
+    nb_sur_util = len(df_recap_filtered[df_recap_filtered['Statut_Utilisation'] == 'Sur-utilisation'])
+    
+    # Calcul des économies potentielles
+    economie_potentielle_totale = df_recap_filtered['Economie_Potentielle_L'].sum()
+    nb_vehicules_a_optimiser = len(df_recap_filtered[df_recap_filtered['Recommandation'].isin(['Forte réduction recommandée', 'Réduction possible'])])
+    
+    # Affichage des métriques en colonnes
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Nombre de Véhicules", f"{total_vehicules}")
+    col2.metric("Dotation Mensuelle Totale", f"{total_dotation_mensuelle:.0f} L")
+    col3.metric("Taux d'Utilisation Global", f"{taux_utilisation_global:.1f}%")
+    
+    col4, col5, col6 = st.columns(3)
+    col4.metric("Véhicules en Sous-utilisation", f"{nb_sous_util}", delta=f"{nb_sous_util/total_vehicules*100:.1f}%" if total_vehicules > 0 else "0%")
+    col5.metric("Véhicules avec Utilisation Normale", f"{nb_normal}", delta=f"{nb_normal/total_vehicules*100:.1f}%" if total_vehicules > 0 else "0%")
+    col6.metric("Véhicules en Sur-utilisation", f"{nb_sur_util}", delta=f"{nb_sur_util/total_vehicules*100:.1f}%" if total_vehicules > 0 else "0%")
+    
+    col7, col8 = st.columns(2)
+    col7.metric("Économie Mensuelle Potentielle", f"{economie_potentielle_totale:.0f} L", 
+               delta=f"{economie_potentielle_totale/total_dotation_mensuelle*100:.1f}%" if total_dotation_mensuelle > 0 else "0%")
+    col8.metric("Véhicules à Optimiser", f"{nb_vehicules_a_optimiser}", 
+               delta=f"{nb_vehicules_a_optimiser/total_vehicules*100:.1f}%" if total_vehicules > 0 else "0%")
+    
+    # --- Graphiques d'analyse des dotations ---
+    st.subheader("📊 Analyse des Dotations")
+    
+    col_graph1, col_graph2 = st.columns(2)
+    with col_graph1:
+        # Distribution du taux d'utilisation
+        fig_distribution = px.histogram(
+            df_recap_filtered, x='Taux_Utilisation_Periode_%',
+            title="Distribution du Taux d'Utilisation des Dotations",
+            labels={'Taux_Utilisation_Periode_%': "Taux d'Utilisation (%)"},
+            histnorm='percent',
+            nbins=20,
+        )
+        fig_distribution.add_vline(x=st.session_state.ss_seuil_sous_utilisation, line_dash="dash", line_color="red", 
+                                  annotation_text=f"Seuil sous-utilisation ({st.session_state.ss_seuil_sous_utilisation}%)")
+        fig_distribution.add_vline(x=100, line_dash="solid", line_color="green", 
+                                  annotation_text="Idéal (100%)")
+        fig_distribution.add_vline(x=st.session_state.ss_seuil_sur_utilisation, line_dash="dash", line_color="orange", 
+                                  annotation_text=f"Seuil sur-utilisation ({st.session_state.ss_seuil_sur_utilisation}%)")
+        st.plotly_chart(fig_distribution, use_container_width=True)
+    
+    with col_graph2:
+        # Répartition des statuts d'utilisation
+        statut_counts = df_recap_filtered['Statut_Utilisation'].value_counts().reset_index()
+        statut_counts.columns = ['Statut', 'Nombre']
+        
+        fig_statut = px.pie(
+            statut_counts, values='Nombre', names='Statut',
+            title="Répartition des Statuts d'Utilisation",
+            color='Statut',
+            color_discrete_map={
+                'Sous-utilisation': 'lightblue',
+                'Normal': 'green',
+                'Sur-utilisation': 'coral'
+            }
+        )
+        st.plotly_chart(fig_statut, use_container_width=True)
+    
+    # Top véhicules sous-utilisés
+    top_sous_util = df_recap_filtered[df_recap_filtered['Statut_Utilisation'] == 'Sous-utilisation'].nlargest(10, 'Economie_Potentielle_L')
+    if not top_sous_util.empty:
+        fig_top_sous = px.bar(
+            top_sous_util,
+            x='Nouveau Immat',
+            y='Economie_Potentielle_L',
+            title="Top 10 Véhicules - Économie Potentielle Mensuelle (L)",
+            color='Taux_Utilisation_Periode_%',
+            color_continuous_scale=px.colors.sequential.Blues_r,  # Échelle inversée pour que le bleu foncé = faible utilisation
+            labels={'Economie_Potentielle_L': 'Économie Mensuelle (L)', 'Nouveau Immat': 'Immatriculation'},
+            hover_data=['Catégorie', 'Dotation_Mensuelle_L', 'Taux_Utilisation_Periode_%', 'Recommandation']
+        )
+        st.plotly_chart(fig_top_sous, use_container_width=True)
 
     # --- Affichage Récapitulatif par Véhicule sur la Période ---
-    st.subheader("Récapitulatif de l'Utilisation des Dotations sur la Période")
-    afficher_dataframe_avec_export(df_recap_filtered, "Récapitulatif Dotations par Véhicule", key="recap_dot_veh")
+    st.subheader("📋 Récapitulatif de l'Utilisation des Dotations")
     
-    if not df_recap_filtered.empty:
-        fig_taux_utilisation = px.bar(
-            df_recap_filtered.sort_values('Taux_Utilisation_Periode_%', ascending=False).head(20), # Top 20
-            x='Nouveau Immat', 
-            y='Taux_Utilisation_Periode_%',
-            color='Catégorie',
-            title="Taux d'Utilisation des Dotations par Véhicule (%) - Top 20",
-            labels={'Taux_Utilisation_Periode_%': "Taux d'Utilisation (%)"},
-            hover_data=['Dotation_Allouee_Periode_L', 'Consommation_Reelle_Periode_L']
+    # Ajouter des filtres visuels directement dans le tableau
+    df_styled = df_recap_filtered.copy()
+    
+    # Renommer les colonnes pour l'affichage
+    columns_display = {
+        'Nouveau Immat': 'Immatriculation', 
+        'Catégorie': 'Catégorie',
+        'Dotation_Mensuelle_L': 'Dotation Mensuelle (L)', 
+        'Nb_Mois_Periode': 'Nb Mois',
+        'Consommation_Reelle_Periode_L': 'Conso. Totale (L)',
+        'Taux_Utilisation_Periode_%': "Taux d'Utilisation (%)", 
+        'Statut_Utilisation': 'Statut',
+        'Economie_Potentielle_L': 'Économie Possible (L/mois)',
+        'Dotation_Optimisee_L': 'Dotation Optimisée (L)',
+        'Recommandation': 'Recommandation',
+        'Variation_Dotation_%': 'Variation Dotation (%)'
+    }
+    
+    cols_to_display = list(columns_display.keys())
+    df_display = df_styled[cols_to_display].rename(columns=columns_display)
+    
+    afficher_dataframe_avec_export(df_display, "Récapitulatif Dotations par Véhicule", key="recap_dot_veh")
+    
+    # --- Affichage d'un Plan d'Optimisation ---
+    vehicules_a_optimiser = df_recap_filtered[df_recap_filtered['Recommandation'].isin(['Forte réduction recommandée', 'Réduction possible'])]
+    
+    if not vehicules_a_optimiser.empty:
+        st.subheader("💡 Plan d'Optimisation des Dotations")
+        
+        optimisation_text = f"""
+        ### Potentiel d'économie identifié
+        
+        D'après l'analyse des données de consommation sur la période sélectionnée:
+        - **{len(vehicules_a_optimiser)}** véhicules pourraient avoir leur dotation optimisée
+        - Économie mensuelle potentielle: **{vehicules_a_optimiser['Economie_Potentielle_L'].sum():.0f} litres**
+        - Économie annuelle projetée: **{vehicules_a_optimiser['Economie_Potentielle_L'].sum() * 12:.0f} litres**
+        
+        Le tableau ci-dessous présente un plan d'optimisation concret avec les nouvelles dotations suggérées.
+        """
+        st.markdown(optimisation_text)
+        
+        # Création d'un DataFrame de plan d'optimisation
+        plan_optimisation = vehicules_a_optimiser[[
+            'Nouveau Immat', 'Catégorie', 'Dotation_Mensuelle_L', 
+            'Dotation_Optimisee_L', 'Variation_Dotation_%', 
+            'Taux_Utilisation_Periode_%', 'Economie_Potentielle_L', 'Recommandation'
+        ]].copy()
+        
+        plan_optimisation.columns = [
+            'Immatriculation', 'Catégorie', 'Dotation Actuelle (L)',
+            'Dotation Recommandée (L)', 'Variation (%)', 
+            "Taux d'Utilisation Actuel (%)", 'Économie Mensuelle (L)', 'Recommandation'
+        ]
+        
+        plan_optimisation = plan_optimisation.sort_values('Économie Mensuelle (L)', ascending=False)
+        
+        afficher_dataframe_avec_export(plan_optimisation, "Plan d'Optimisation des Dotations", key="plan_optimisation")
+        
+        # Visualisation du potentiel d'économie
+        fig_eco = px.bar(
+            plan_optimisation.head(15),  # Limiter aux 15 premiers pour lisibilité
+            x='Immatriculation',
+            y=['Dotation Actuelle (L)', 'Dotation Recommandée (L)'],
+            barmode='group',
+            title="Comparaison des Dotations Actuelles vs Recommandées (Top 15)",
+            labels={'value': 'Dotation (L)', 'variable': ''},
+            color_discrete_map={
+                'Dotation Actuelle (L)': 'lightblue',
+                'Dotation Recommandée (L)': 'darkblue'
+            }
         )
-        fig_taux_utilisation.add_hline(y=100, line_dash="dash", line_color="red", annotation_text="Objectif 100%")
-        st.plotly_chart(fig_taux_utilisation, use_container_width=True)
+        st.plotly_chart(fig_eco, use_container_width=True)
+        
+        # Ajouter un bouton d'export pour le plan complet
+        total_eco_mensuelle = plan_optimisation['Économie Mensuelle (L)'].sum()
+        total_eco_annuelle = total_eco_mensuelle * 12
+        
+        st.info(f"💰 Économie totale estimée: {total_eco_mensuelle:.0f} L/mois, soit {total_eco_annuelle:.0f} L/an")
+    else:
+        st.info("Aucun véhicule n'a été identifié comme nécessitant une optimisation de sa dotation selon les critères actuels.")
 
     # --- Affichage Détail Mensuel (si un véhicule est sélectionné) ---
     if selected_vehicle_dot != "Tous les véhicules":
-        st.subheader(f"Détail Mensuel pour le Véhicule : {selected_vehicle_dot}")
+        st.subheader(f"📅 Détail Mensuel pour le Véhicule : {selected_vehicle_dot}")
         if not df_detail_mensuel_filtered.empty:
-            afficher_dataframe_avec_export(df_detail_mensuel_filtered, f"Détail Mensuel Dotations - {selected_vehicle_dot}", key="detail_dot_mensuel_veh")
+            # Renommer les colonnes pour l'affichage
+            columns_detail_display = {
+                'Nouveau Immat': 'Immatriculation',
+                'AnneeMois': 'Mois',
+                'Dotation_Mensuelle_L': 'Dotation (L)',
+                'Consommation_Mois_L': 'Consommation (L)',
+                'Difference_Mois_L': 'Écart (L)',
+                'Taux_Utilisation_Mois_%': "Taux d'Utilisation (%)",
+                'Statut_Utilisation': 'Statut',
+                'Potentiel_Economie_L': 'Économie Possible (L)'
+            }
+            
+            df_detail_display = df_detail_mensuel_filtered.rename(columns=columns_detail_display)
+            
+            afficher_dataframe_avec_export(df_detail_display, 
+                                          f"Détail Mensuel Dotations - {selected_vehicle_dot}", 
+                                          key="detail_dot_mensuel_veh")
 
+            # Visualisation de l'évolution mensuelle
             fig_detail_veh = px.line(
                 df_detail_mensuel_filtered,
                 x='AnneeMois',
                 y=['Dotation_Mensuelle_L', 'Consommation_Mois_L'],
-                title=f"Dotation vs Consommation Mensuelle - {selected_vehicle_dot}",
-                labels={'value': 'Volume (L)', 'variable': 'Type'},
+                title=f"Évolution Mensuelle: Dotation vs Consommation - {selected_vehicle_dot}",
+                labels={'value': 'Volume (L)', 'variable': 'Type', 'AnneeMois': 'Mois'},
+                markers=True,
+                color_discrete_map={
+                    'Dotation_Mensuelle_L': 'blue',
+                    'Consommation_Mois_L': 'green'
+                }
+            )
+            
+            # Ajouter une ligne pour le taux d'utilisation (axe secondaire)
+            fig_taux = px.line(
+                df_detail_mensuel_filtered,
+                x='AnneeMois',
+                y=['Taux_Utilisation_Mois_%'],
+                labels={'Taux_Utilisation_Mois_%': "Taux d'Utilisation (%)"},
                 markers=True
             )
-            st.plotly_chart(fig_detail_veh, use_container_width=True)
+            
+            # Ajouter second axe Y
+            fig_combined = px.line()
+            fig_combined.add_trace(fig_detail_veh.data[0])  # Dotation
+            fig_combined.add_trace(fig_detail_veh.data[1])  # Consommation
+            
+            # Ajouter le taux d'utilisation avec axe secondaire
+            taux_trace = fig_taux.data[0]
+            taux_trace.yaxis = "y2"
+            taux_trace.name = "Taux d'Utilisation (%)"
+            taux_trace.line.color = "red"
+            fig_combined.add_trace(taux_trace)
+            
+            # Configurer les axes
+            fig_combined.update_layout(
+                title=f"Évolution Mensuelle: Dotation, Consommation et Taux d'Utilisation - {selected_vehicle_dot}",
+                yaxis=dict(title="Volume (L)"),
+                yaxis2=dict(title="Taux d'Utilisation (%)", overlaying="y", side="right"),
+                legend=dict(orientation="h", y=1.1)
+            )
+            
+            st.plotly_chart(fig_combined, use_container_width=True)
+            
+            # Analyse des variations saisonnières si données suffisantes
+            if len(df_detail_mensuel_filtered) >= 3:
+                st.subheader("🔄 Analyse des Variations Saisonnières")
+                
+                # Extraire le mois pour analyse saisonnière
+                df_detail_mensuel_filtered['Mois'] = pd.to_datetime(df_detail_mensuel_filtered['AnneeMois'] + '-01').dt.month_name()
+                
+                saisonnalite = df_detail_mensuel_filtered.groupby('Mois').agg(
+                    Taux_Utilisation_Moyen=('Taux_Utilisation_Mois_%', 'mean'),
+                    Consommation_Moyenne=('Consommation_Mois_L', 'mean'),
+                    Nb_Observations=('AnneeMois', 'count')
+                ).reset_index()
+                
+                # Ordonner les mois chronologiquement
+                mois_ordre = ['January', 'February', 'March', 'April', 'May', 'June', 
+                              'July', 'August', 'September', 'October', 'November', 'December']
+                saisonnalite['Mois'] = pd.Categorical(saisonnalite['Mois'], categories=mois_ordre, ordered=True)
+                saisonnalite = saisonnalite.sort_values('Mois')
+                
+                fig_saison = px.line(
+                    saisonnalite,
+                    x='Mois',
+                    y='Taux_Utilisation_Moyen',
+                    title=f"Variations Saisonnières du Taux d'Utilisation - {selected_vehicle_dot}",
+                    labels={'Taux_Utilisation_Moyen': "Taux d'Utilisation Moyen (%)", 'Mois': 'Mois'},
+                    markers=True
+                )
+                
+                # Ajouter ligne horizontale pour 100%
+                fig_saison.add_hline(y=100, line_dash="dash", line_color="green", 
+                                    annotation_text="Utilisation idéale (100%)")
+                
+                st.plotly_chart(fig_saison, use_container_width=True)
+                
+                # Afficher des recommandations saisonnières
+                if len(saisonnalite) >= 3:  # Au moins 3 mois pour faire des recommandations
+                    mois_faible_util = saisonnalite[saisonnalite['Taux_Utilisation_Moyen'] < 70]
+                    mois_forte_util = saisonnalite[saisonnalite['Taux_Utilisation_Moyen'] > 110]
+                    
+                    if not mois_faible_util.empty or not mois_forte_util.empty:
+                        st.info("💡 **Recommandation saisonnière**: Envisagez d'ajuster la dotation en fonction des mois:")
+                        
+                        if not mois_faible_util.empty:
+                            msg_faible = ", ".join(mois_faible_util['Mois'])
+                            st.markdown(f"- **Réduction possible** pour les mois de: {msg_faible}")
+                        
+                        if not mois_forte_util.empty:
+                            msg_forte = ", ".join(mois_forte_util['Mois'])
+                            st.markdown(f"- **Augmentation recommandée** pour les mois de: {msg_forte}")
+            
+            # Obtenir les infos vehicle depuis df_vehicules
+            info_vehicle = df_vehicules[df_vehicules['Nouveau Immat'] == selected_vehicle_dot].iloc[0] if len(df_vehicules[df_vehicules['Nouveau Immat'] == selected_vehicle_dot]) > 0 else None
+            
+            if info_vehicle is not None:
+                st.subheader("📝 Résumé et Recommandations")
+                
+                # Trouver les données récapitulatives pour ce véhicule
+                vehicle_recap = df_recap_filtered[df_recap_filtered['Nouveau Immat'] == selected_vehicle_dot].iloc[0] if len(df_recap_filtered[df_recap_filtered['Nouveau Immat'] == selected_vehicle_dot]) > 0 else None
+                
+                if vehicle_recap is not None:
+                    # Créer un résumé personnalisé
+                    statut = vehicle_recap['Statut_Utilisation']
+                    taux_util = vehicle_recap['Taux_Utilisation_Periode_%']
+                    dotation_actuelle = vehicle_recap['Dotation_Mensuelle_L']
+                    dotation_optimisee = vehicle_recap['Dotation_Optimisee_L']
+                    
+                    st.write(f"**Marque/Modèle**: {info_vehicle.get('Marque', 'N/A')} {info_vehicle.get('Modèle', 'N/A')}")
+                    st.write(f"**Catégorie**: {info_vehicle.get('Catégorie', 'N/A')}")
+                    st.write(f"**Statut d'utilisation**: {statut} ({taux_util:.1f}%)")
+                    
+                    if statut == 'Sous-utilisation':
+                        eco_potentielle = vehicle_recap['Economie_Potentielle_L']
+                        variation = vehicle_recap['Variation_Dotation_%']
+                        
+                        st.warning(f"""
+                        📉 **Ce véhicule sous-utilise sa dotation actuelle.**
+                        
+                        - Dotation actuelle: {dotation_actuelle:.0f} L/mois
+                        - Dotation optimisée recommandée: {dotation_optimisee:.0f} L/mois ({variation:.1f}%)
+                        - Économie mensuelle potentielle: {eco_potentielle:.1f} L/mois
+                        - Économie annuelle projetée: {eco_potentielle * 12:.0f} L/an
+                        
+                        Recommandation: {vehicle_recap['Recommandation']}
+                        """)
+                    elif statut == 'Sur-utilisation':
+                        st.error(f"""
+                        📈 **Ce véhicule dépasse régulièrement sa dotation actuelle.**
+                        
+                        - Dotation actuelle: {dotation_actuelle:.0f} L/mois
+                        - Dotation suggérée: {dotation_optimisee:.0f} L/mois
+                        
+                        Recommandation: Envisagez d'augmenter la dotation ou d'analyser les raisons de cette sur-utilisation.
+                        """)
+                    else:  # Normal
+                        st.success(f"""
+                        ✅ **Ce véhicule utilise sa dotation de manière optimale.**
+                        
+                        - Dotation actuelle: {dotation_actuelle:.0f} L/mois
+                        - Taux d'utilisation: {taux_util:.1f}%
+                        
+                        Recommandation: Maintenir la dotation actuelle.
+                        """)
         else:
             st.info(f"Aucun détail mensuel à afficher pour {selected_vehicle_dot} avec les filtres actuels.")
     else:
-        with st.expander("Voir le détail mensuel pour tous les véhicules (peut être long)"):
-             afficher_dataframe_avec_export(df_detail_mensuel_filtered, "Détail Mensuel Dotations - Tous Véhicules Filtrés", key="detail_dot_mensuel_all_veh")
+        with st.expander("Voir le détail mensuel pour tous les véhicules"):
+            afficher_dataframe_avec_export(df_detail_mensuel_filtered, 
+                                          "Détail Mensuel Dotations - Tous Véhicules Filtrés", 
+                                          key="detail_dot_mensuel_all_veh")
+            
+            # Évolution du taux d'utilisation global par mois
+            agg_mois = df_detail_mensuel_filtered.groupby('AnneeMois').agg(
+                Dotation_Totale=('Dotation_Mensuelle_L', 'sum'),
+                Consommation_Totale=('Consommation_Mois_L', 'sum')
+            ).reset_index()
+            
+            agg_mois['Taux_Utilisation_%'] = (agg_mois['Consommation_Totale'] / agg_mois['Dotation_Totale'] * 100).round(1)
+            
+            fig_global_mois = px.line(
+                agg_mois,
+                x='AnneeMois',
+                y='Taux_Utilisation_%',
+                title="Évolution Mensuelle du Taux d'Utilisation Global",
+                labels={'AnneeMois': 'Mois', 'Taux_Utilisation_%': "Taux d'Utilisation (%)"},
+                markers=True
+            )
+            
+            fig_global_mois.add_hline(y=100, line_dash="dash", line_color="green", 
+                                     annotation_text="Utilisation idéale (100%)")
+            
+            st.plotly_chart(fig_global_mois, use_container_width=True)
 
 # ---------------------------------------------------------------------
 # Fonctions d'Affichage des Pages
@@ -1626,6 +2126,31 @@ def afficher_page_parametres(df_vehicules: Optional[pd.DataFrame] = None):
         else:
             st.info("Chargez les données pour définir les seuils par catégorie.")
             st.number_input("Seuil Consommation par Défaut (utilisé si catégorie non définie)", value=DEFAULT_CONSO_SEUIL, disabled=True)
+    
+    with st.expander("Paramètres d'Analyse des Dotations"):
+        st.session_state.ss_seuil_sous_utilisation = st.slider(
+            "Seuil de sous-utilisation des dotations (%)", 
+            min_value=30, max_value=90, 
+            value=st.session_state.get('ss_seuil_sous_utilisation', DEFAULT_SEUIL_SOUS_UTILISATION),
+            step=5, key='param_seuil_sous_util',
+            help="Un véhicule est considéré en sous-utilisation quand son taux d'utilisation est inférieur à ce seuil."
+        )
+        
+        st.session_state.ss_seuil_sur_utilisation = st.slider(
+            "Seuil de sur-utilisation des dotations (%)", 
+            min_value=100, max_value=150, 
+            value=st.session_state.get('ss_seuil_sur_utilisation', DEFAULT_SEUIL_SUR_UTILISATION),
+            step=5, key='param_seuil_sur_util',
+            help="Un véhicule est considéré en sur-utilisation quand son taux d'utilisation dépasse ce seuil."
+        )
+        
+        st.session_state.ss_mois_min_analyse = st.slider(
+            "Nombre minimum de mois pour l'analyse fiable", 
+            min_value=1, max_value=6, 
+            value=st.session_state.get('ss_mois_min_analyse', DEFAULT_MOIS_MIN_ANALYSE),
+            step=1, key='param_mois_min',
+            help="Nombre minimum de mois de données requis pour considérer l'analyse des tendances comme fiable."
+        )
 
     with st.expander("Poids des Anomalies pour Score de Risque"):
         st.caption("Ajustez l'importance de chaque type d'anomalie dans le calcul du score de risque.")
