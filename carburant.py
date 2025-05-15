@@ -4157,7 +4157,6 @@ def afficher_page_autres_cartes(df_transactions: pd.DataFrame, df_autres: pd.Dat
 # Point d'entrée avec navigation mise à jour
 # ---------------------------------------------------------------------
 def main():
-    st.set_page_config(layout="wide") # Utiliser toute la largeur de la page
     st.title("📊 Gestion & Analyse Cartes Carburant")
 
     st.sidebar.header("1. Chargement des Données")
