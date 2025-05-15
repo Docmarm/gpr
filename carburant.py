@@ -354,9 +354,16 @@ def afficher_dataframe_avec_export(df: pd.DataFrame, titre: str = "Tableau", key
 
     nb_lignes = len(df)
     st.markdown(f"### {titre} ({nb_lignes:,} lignes)")
-    st.dataframe(df, use_container_width=True)
+    
+    # Explicitly convert object columns to string to avoid ArrowTypeError
+    df_display = df.copy()
+    for col in df_display.columns:
+        if df_display[col].dtype == 'object':
+            df_display[col] = df_display[col].astype(str)
+
+    st.dataframe(df_display, use_container_width=True)
     try:
-        excel_data = to_excel(df)
+        excel_data = to_excel(df_display) # Use the potentially modified df for export too
         nom_fic = f"{titre.lower().replace(' ', '_').replace('(', '').replace(')', '').replace(':', '')[:50]}.xlsx" 
         st.download_button(
             label=f"Exporter '{titre}' en Excel",
