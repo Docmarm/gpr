@@ -40,6 +40,7 @@ DEFAULT_POIDS_KM_SAUT = 6
 DEFAULT_POIDS_HORS_HORAIRE = 2
 DEFAULT_POIDS_HORS_SERVICE = 9
 DEFAULT_POIDS_FACT_DOUBLE = 7
+DEFAULT_POIDS_ANOMALIE_GEO = 10 # Nouveau poids pour anomalie géographique
 
 # --- Nouveaux poids pour anomalies de géolocalisation ---
 DEFAULT_POIDS_TRAJET_HORS_HEURES = 6
@@ -1417,6 +1418,36 @@ def analyser_geolocalisation_vs_transactions(
         np.nan
     )
 
+    # Ajouter la consommation basée sur la distance déclarée
+    comparaison['Consommation_100km_Declaree'] = np.where(
+        comparaison['Distance_Declaree_Totale'] > 0,
+        (comparaison['Volume_Carburant_Total'] / comparaison['Distance_Declaree_Totale']) * 100,
+        np.nan
+    )
+
+    # Calculer l'écart entre les deux consommations
+    comparaison['Ecart_Consommation'] = comparaison['Consommation_100km_Declaree'] - comparaison['Consommation_100km_Reelle']
+    comparaison['Pourcentage_Ecart_Consommation'] = np.where(
+        comparaison['Consommation_100km_Reelle'] > 0,
+        (comparaison['Ecart_Consommation'] / comparaison['Consommation_100km_Reelle']) * 100,
+        np.nan
+    )
+
+    # Identifier les anomalies significatives (écart > 10% et au moins 10km)
+    comparaison['Consommation_100km_Declaree'] = np.where(
+        comparaison['Distance_Declaree_Totale'] > 0,
+        (comparaison['Volume_Carburant_Total'] / comparaison['Distance_Declaree_Totale']) * 100,
+        np.nan
+    )
+
+    # Calculer l'écart entre les deux consommations
+    comparaison['Ecart_Consommation'] = comparaison['Consommation_100km_Declaree'] - comparaison['Consommation_100km_Reelle']
+    comparaison['Pourcentage_Ecart_Consommation'] = np.where(
+        comparaison['Consommation_100km_Reelle'] > 0,
+        (comparaison['Ecart_Consommation'] / comparaison['Consommation_100km_Reelle']) * 100,
+        np.nan
+    )
+
     # Identifier les anomalies significatives (écart > 10% et au moins 10km)
     seuil_ecart_pct = 10  # Pourcentage
     seuil_ecart_km = 10   # Kilomètres
@@ -2599,6 +2630,7 @@ def afficher_page_analyse_geolocalisation(
             cols_comparaison = [
                 'Immatriculation', 'Distance_Geoloc_Totale', 'Distance_Declaree_Totale',
                 'Ecart_Distance', 'Pourcentage_Ecart', 'Consommation_100km_Reelle',
+                'Consommation_100km_Declaree', 'Ecart_Consommation', 'Pourcentage_Ecart_Consommation',
                 'Volume_Carburant_Total', 'Nb_Trajets', 'Nb_Transactions'
             ]
             afficher_dataframe_avec_export(
@@ -2606,6 +2638,20 @@ def afficher_page_analyse_geolocalisation(
                 "Comparaison Kilométrage",
                 key="geoloc_comparaison_km"
             )
+
+            # Et ajouter un graphique de comparaison des consommations
+            if 'Consommation_100km_Reelle' in comparaison.columns and 'Consommation_100km_Declaree' in comparaison.columns:
+                comparaison_conso = comparaison.dropna(subset=['Consommation_100km_Reelle', 'Consommation_100km_Declaree']).sort_values('Pourcentage_Ecart_Consommation', ascending=False)
+                if not comparaison_conso.empty:
+                    fig_conso_compare = px.bar(
+                        comparaison_conso,
+                        x='Immatriculation',
+                        y=['Consommation_100km_Reelle', 'Consommation_100km_Declaree'],
+                        title="Comparaison Consommation Réelle (basée géoloc) vs Déclarée (basée km carte)",
+                        labels={'value': 'Consommation (L/100km)', 'variable': 'Source'},
+                        barmode='group'
+                    )
+                    st.plotly_chart(fig_conso_compare, use_container_width=True)
 
             # Graphique de comparaison consommation
             if 'Consommation_100km_Reelle' in comparaison.columns:
@@ -3622,33 +3668,34 @@ def afficher_page_parametres(df_vehicules: Optional[pd.DataFrame] = None):
             c1_geo, c2_geo = st.columns(2)
             with c1_geo:
                 st.session_state.ss_poids_trajet_hors_heures = st.slider(
-                    "Poids: Trajet Hors Heures (Géoloc)", 1, 15,
+                    "Poids: Trajet Hors Heures (Géoloc)", 0, 15,
                     st.session_state.get('ss_poids_trajet_hors_heures', DEFAULT_POIDS_TRAJET_HORS_HEURES),
                     key='poids_trajet_hors_heures_geoloc'
                 )
                 st.session_state.ss_poids_trajet_weekend = st.slider(
-                    "Poids: Trajet Weekend (Géoloc)", 1, 15,
+                    "Poids: Trajet Weekend (Géoloc)", 0, 15,
                     st.session_state.get('ss_poids_trajet_weekend', DEFAULT_POIDS_TRAJET_WEEKEND),
                     key='poids_trajet_weekend_geoloc'
                 )
                 st.session_state.ss_poids_arrets_frequents = st.slider(
-                    "Poids: Vitesse Lente (Arrêts Fréquents non déclarés)", 1, 15,
+                    "Poids: Vitesse Lente (Arrêts Fréquents non déclarés)", 0, 15,
                     st.session_state.get('ss_poids_arrets_frequents', DEFAULT_POIDS_ARRETS_FREQUENTS),
                     key='poids_arrets_frequents_geoloc'
                 )
+                st.session_state.ss_poids_anomalie_geo = st.slider("Poids: Anomalie Géographique", 0, 15, st.session_state.get('ss_poids_anomalie_geo', DEFAULT_POIDS_ANOMALIE_GEO), key='poids_geo')
             with c2_geo:
                 st.session_state.ss_poids_detour_suspect = st.slider(
-                    "Poids: Détour Suspect (Géoloc)", 1, 15,
+                    "Poids: Détour Suspect (Géoloc)", 0, 15,
                     st.session_state.get('ss_poids_detour_suspect', DEFAULT_POIDS_DETOUR_SUSPECT),
                     key='poids_detour_suspect_geoloc'
                 )
                 st.session_state.ss_poids_transaction_sans_presence = st.slider(
-                    "Poids: Transaction Sans Présence (Géoloc)", 1, 15,
+                    "Poids: Transaction Sans Présence (Géoloc)", 0, 15,
                     st.session_state.get('ss_poids_transaction_sans_presence', DEFAULT_POIDS_TRANSACTION_SANS_PRESENCE),
                     key='poids_transaction_sans_presence_geoloc'
                 )
                 st.session_state.ss_poids_vitesse_excessive = st.slider(
-                    "Poids: Vitesse Excessive (Géoloc)", 1, 15,
+                    "Poids: Vitesse Excessive (Géoloc)", 0, 15,
                     st.session_state.get('ss_poids_vitesse_excessive', DEFAULT_POIDS_VITESSE_EXCESSIVE),
                     key='poids_vitesse_excessive_geoloc'
                 )
