@@ -57,6 +57,7 @@ DEFAULT_SEUIL_DETOUR_PCT = 20    # Pourcentage au-delà duquel un trajet est con
 DEFAULT_HEURE_DEBUT_SERVICE = 7  # Heure normale de début de service
 DEFAULT_HEURE_FIN_SERVICE = 19   # Heure normale de fin de service
 DEFAULT_NB_ARRETS_SUSPECT = 4    # Nombre d'arrêts au-delà duquel c'est suspect pour un trajet court
+DEFAULT_VITESSE_EXCESSIVE_SEUIL = 90  # Vitesse maximale en km/h au-delà de laquelle on considère un excès de vitesse
 
 # ---------------------------------------------------------------------
 # Initialisation Session State pour les Paramètres
@@ -87,13 +88,18 @@ def initialize_session_state(df_vehicules: Optional[pd.DataFrame] = None):
         'ss_heure_debut_service': DEFAULT_HEURE_DEBUT_SERVICE,
         'ss_heure_fin_service': DEFAULT_HEURE_FIN_SERVICE,
         'ss_nb_arrets_suspect': DEFAULT_NB_ARRETS_SUSPECT,
+        'ss_vitesse_excessive_seuil': DEFAULT_VITESSE_EXCESSIVE_SEUIL,  # Nouveau paramètre pour vitesse maximale
         # Nouveaux poids pour anomalies de géolocalisation
         'ss_poids_trajet_hors_heures': DEFAULT_POIDS_TRAJET_HORS_HEURES,
         'ss_poids_trajet_weekend': DEFAULT_POIDS_TRAJET_WEEKEND,
         'ss_poids_arrets_frequents': DEFAULT_POIDS_ARRETS_FREQUENTS,
         'ss_poids_detour_suspect': DEFAULT_POIDS_DETOUR_SUSPECT,
         'ss_poids_transaction_sans_presence': DEFAULT_POIDS_TRANSACTION_SANS_PRESENCE,
-        'ss_poids_vitesse_excessive': DEFAULT_POIDS_VITESSE_EXCESSIVE
+        'ss_poids_vitesse_excessive': DEFAULT_POIDS_VITESSE_EXCESSIVE,
+        # Paramètres d'activation/désactivation des types d'anomalies
+        'ss_activer_trajets_suspects': False,  # Désactivé par défaut
+        'ss_activer_detours_suspects': False,  # Désactivé par défaut
+        'ss_activer_transactions_sans_presence': True   # Activé par défaut
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -642,6 +648,89 @@ def detecter_anomalies(
 
 # --- Fonctions d'analyse spécifiques ---
 
+def analyser_stations_risque(df_anomalies: pd.DataFrame, df_transactions: pd.DataFrame) -> pd.DataFrame:
+    """
+    Analyse les stations en fonction des anomalies détectées pour identifier celles présentant 
+    des risques élevés de fraude.
+    
+    Args:
+        df_anomalies: DataFrame des anomalies détectées
+        df_transactions: DataFrame complet des transactions
+        
+    Returns:
+        DataFrame des stations classées par niveau de risque
+    """
+    if df_anomalies.empty or 'Place' not in df_anomalies.columns:
+        return pd.DataFrame()
+    
+    # Compter le nombre total de transactions par station
+    transactions_par_station = df_transactions.groupby('Place').agg(
+        Nb_Total_Transactions=('Amount', 'count'),
+        Volume_Total=('Quantity', 'sum'),
+        Montant_Total=('Amount', 'sum')
+    ).reset_index()
+    
+    # Compter le nombre d'anomalies par station et par type
+    anomalies_par_station = df_anomalies.groupby(['Place', 'type_anomalie']).size().reset_index(name='Nb_Anomalies')
+    
+    # Types d'anomalies liées à la fraude potentielle par carte
+    types_fraude_carte = [
+        'Dépassement capacité', 
+        'Prises rapprochées', 
+        'Facturation double suspectée',
+        'Transaction sans présence (géoloc)',
+        'Véhicule Hors Service'
+    ]
+    
+    # Filtrer pour ne garder que les anomalies liées à la fraude par carte
+    anomalies_fraude = anomalies_par_station[anomalies_par_station['type_anomalie'].isin(types_fraude_carte)]
+    
+    # Agréger par station
+    resume_stations = anomalies_fraude.groupby('Place').agg(
+        Nb_Anomalies_Fraude=('Nb_Anomalies', 'sum')
+    ).reset_index()
+    
+    # Fusionner avec les statistiques générales des transactions
+    resume_complet = resume_stations.merge(
+        transactions_par_station, on='Place', how='left'
+    )
+    
+    # Calculer le pourcentage d'anomalies
+    resume_complet['Pourcentage_Anomalies'] = np.where(
+        resume_complet['Nb_Total_Transactions'] > 0,
+        (resume_complet['Nb_Anomalies_Fraude'] / resume_complet['Nb_Total_Transactions']) * 100,
+        0
+    )
+    
+    # Calculer un score de risque (formule pondérée)
+    resume_complet['Score_Risque_Station'] = resume_complet['Pourcentage_Anomalies'] * np.log1p(resume_complet['Nb_Anomalies_Fraude'])
+    
+    # Déterminer le niveau de risque
+    resume_complet['Niveau_Risque'] = pd.cut(
+        resume_complet['Score_Risque_Station'],
+        bins=[-float('inf'), 5, 10, 20, float('inf')],
+        labels=['Faible', 'Modéré', 'Élevé', 'Critique']
+    )
+    
+    # Récupérer les types d'anomalies les plus fréquents par station
+    anomalies_principales = {}
+    for station in resume_complet['Place'].unique():
+        top_anomalies = anomalies_fraude[anomalies_fraude['Place'] == station].sort_values('Nb_Anomalies', ascending=False)
+        if not top_anomalies.empty:
+            top_types = top_anomalies.head(2)['type_anomalie'].tolist()
+            anomalies_principales[station] = " + ".join(top_types)
+        else:
+            anomalies_principales[station] = "N/A"
+    
+    resume_complet['Anomalies_Principales'] = resume_complet['Place'].map(anomalies_principales)
+    
+    # Arrondir les valeurs numériques
+    resume_complet['Pourcentage_Anomalies'] = resume_complet['Pourcentage_Anomalies'].round(1)
+    resume_complet['Score_Risque_Station'] = resume_complet['Score_Risque_Station'].round(1)
+    
+    # Trier par score de risque décroissant
+    return resume_complet.sort_values('Score_Risque_Station', ascending=False)
+
 def analyser_consommation_vehicule(vehicule_data: pd.DataFrame, info_vehicule: pd.Series) -> Dict[str, Any]:
     """Analyse la consommation d'un véhicule spécifique."""
     if vehicule_data.empty:
@@ -971,8 +1060,9 @@ def analyser_consommation_par_periode(
 # ---------------------------------------------------------------------
 # NOUVELLE FONCTION : Amélioration du dashboard
 # ---------------------------------------------------------------------
-def ameliorer_dashboard(df_transactions: pd.DataFrame, df_vehicules: pd.DataFrame, global_date_debut: datetime.date, global_date_fin: datetime.date, kpi_cat_dash: pd.DataFrame, df_vehicle_kpi_dash: pd.DataFrame):
+def ameliorer_dashboard(df_transactions: pd.DataFrame, df_vehicules: pd.DataFrame, global_date_debut: datetime.date, global_date_fin: datetime.date, kpi_cat_dash: pd.DataFrame, df_vehicle_kpi_dash: pd.DataFrame, df_geoloc: Optional[pd.DataFrame] = None):
     """Ajoute une section d'aperçu des excès de consommation au tableau de bord"""
+    # Section existante...
     with st.expander("⚠️ Aperçu des Excès de Consommation (Mensuel)", expanded=True):
         _, conso_veh_mois = analyser_consommation_par_periode(
             df_transactions, df_vehicules, global_date_debut, global_date_fin,
@@ -1006,6 +1096,27 @@ def ameliorer_dashboard(df_transactions: pd.DataFrame, df_vehicules: pd.DataFram
                 st.success("✅ Aucun excès de consommation détecté pour les périodes analysées.")
         else:
             st.info("Données insuffisantes pour l'analyse des excès de consommation.")
+    
+    # Ajouter une nouvelle section pour les véhicules sans géolocalisation
+    if df_geoloc is not None and not df_geoloc.empty:
+        with st.expander("⚠️ Véhicules Sans Données de Géolocalisation", expanded=False):
+            with st.spinner("Analyse des véhicules sans géolocalisation..."):
+                df_vehicules_sans_geoloc_dash = analyser_vehicules_sans_geoloc(
+                    df_transactions, df_vehicules, df_geoloc, global_date_debut, global_date_fin
+                )
+            
+            if df_vehicules_sans_geoloc_dash.empty:
+                st.success("✅ Tous les véhicules avec des transactions ont des données de géolocalisation.")
+            else:
+                nb_vehicules_sans_geoloc = len(df_vehicules_sans_geoloc_dash)
+                st.warning(f"⚠️ {nb_vehicules_sans_geoloc} véhicules ont effectué des transactions sans données de géolocalisation correspondantes.")
+                
+                # Afficher un résumé simplifié
+                df_resume = df_vehicules_sans_geoloc_dash[['Immatriculation', 'Catégorie', 'Nb_Transactions', 'Volume_Total_L']]
+                st.dataframe(df_resume.head(5), use_container_width=True)
+                
+                if nb_vehicules_sans_geoloc > 5:
+                    st.info(f"👉 *{nb_vehicules_sans_geoloc - 5} autres véhicules non affichés. Consultez la page 'Géolocalisation' > onglet 'Véhicules Sans Géoloc' pour tous les détails.*")
 
 # ---------------------------------------------------------------------
 # NOUVELLE FONCTION : Affichage de la page d'analyse par période
@@ -1694,6 +1805,10 @@ def detecter_trajets_suspects(
     Returns:
         Un DataFrame des trajets suspects avec les détails et le score de risque.
     """
+    # Vérifier si la détection est activée
+    if not st.session_state.get('ss_activer_trajets_suspects', True):
+        return pd.DataFrame()  # Retourner un DataFrame vide si désactivé
+        
     # Paramètres (récupérés de session_state)
     heure_debut_service = st.session_state.get('ss_heure_debut_service', DEFAULT_HEURE_DEBUT_SERVICE)
     heure_fin_service = st.session_state.get('ss_heure_fin_service', DEFAULT_HEURE_FIN_SERVICE)
@@ -1910,6 +2025,94 @@ def analyser_correspondance_transactions_geoloc(
 
     return df_trans_avec_immat, transactions_suspectes
 
+def analyser_vehicules_sans_geoloc(
+    df_transactions: pd.DataFrame,
+    df_vehicules: pd.DataFrame,
+    df_geoloc: pd.DataFrame,
+    date_debut: datetime.date,
+    date_fin: datetime.date
+) -> pd.DataFrame:
+    """
+    Identifie les véhicules ayant effectué des transactions mais sans données de géolocalisation correspondantes.
+    
+    Args:
+        df_transactions: DataFrame des transactions.
+        df_vehicules: DataFrame des véhicules.
+        df_geoloc: DataFrame des données de géolocalisation.
+        date_debut: Date de début de la période d'analyse.
+        date_fin: Date de fin de la période d'analyse.
+        
+    Returns:
+        DataFrame contenant les véhicules sans géolocalisation et leurs statistiques.
+    """
+    # Filtrer les transactions pour la période
+    mask_date_trans = (df_transactions['Date'].dt.date >= date_debut) & (df_transactions['Date'].dt.date <= date_fin)
+    df_trans_filtered = df_transactions[mask_date_trans].copy()
+    
+    # Fusionner avec les informations véhicules
+    df_trans_with_veh = df_trans_filtered.merge(
+        df_vehicules[['N° Carte', 'Nouveau Immat', 'Catégorie']],
+        left_on='Card num.',
+        right_on='N° Carte',
+        how='inner'
+    )
+    
+    # Obtenir la liste des véhicules avec transactions
+    vehicules_avec_transactions = set(df_trans_with_veh['Nouveau Immat'].unique())
+    
+    # Filtrer les données géoloc pour la période
+    mask_date_geoloc = (df_geoloc['Date'].dt.date >= date_debut) & (df_geoloc['Date'].dt.date <= date_fin)
+    df_geoloc_filtered = df_geoloc[mask_date_geoloc].copy()
+    
+    # Obtenir la liste des véhicules avec données géoloc
+    vehicules_avec_geoloc = set(df_geoloc_filtered['Véhicule'].unique())
+    
+    # Identifier les véhicules avec transactions mais sans géoloc
+    vehicules_sans_geoloc = vehicules_avec_transactions - vehicules_avec_geoloc
+    
+    # Si aucun véhicule ne répond au critère, retourner un DataFrame vide
+    if not vehicules_sans_geoloc:
+        return pd.DataFrame()
+    
+    # Calculer les statistiques pour ces véhicules
+    resultats = []
+    for immat in vehicules_sans_geoloc:
+        veh_trans = df_trans_with_veh[df_trans_with_veh['Nouveau Immat'] == immat]
+        
+        # Agréger les données de transactions
+        nb_transactions = len(veh_trans)
+        premiere_transaction = veh_trans['Date'].min()
+        derniere_transaction = veh_trans['Date'].max()
+        volume_total = veh_trans['Quantity'].sum()
+        montant_total = veh_trans['Amount'].sum()
+        categorie_veh = veh_trans['Catégorie'].iloc[0] if not veh_trans.empty else "Inconnue"
+        
+        # Calculer le nombre de jours distincts avec des transactions
+        jours_distincts = veh_trans['Date'].dt.date.nunique()
+        
+        # Récupérer la carte associée
+        carte = veh_trans['Card num.'].iloc[0] if not veh_trans.empty else "Inconnue"
+        
+        resultats.append({
+            'Immatriculation': immat,
+            'N° Carte': carte,
+            'Catégorie': categorie_veh,
+            'Nb_Transactions': nb_transactions,
+            'Volume_Total_L': volume_total,
+            'Montant_Total_CFA': montant_total,
+            'Jours_Avec_Transactions': jours_distincts,
+            'Première_Transaction': premiere_transaction,
+            'Dernière_Transaction': derniere_transaction
+        })
+    
+    # Créer le DataFrame de résultats
+    df_resultats = pd.DataFrame(resultats)
+    
+    # Trier par nombre de transactions décroissant
+    if not df_resultats.empty:
+        df_resultats = df_resultats.sort_values('Nb_Transactions', ascending=False)
+    
+    return df_resultats
 
 def detecter_detours_suspects(
     df_geoloc: pd.DataFrame,
@@ -1928,6 +2131,10 @@ def detecter_detours_suspects(
     Returns:
         Un DataFrame des trajets avec détours suspects.
     """
+    # Vérifier si la détection est activée
+    if not st.session_state.get('ss_activer_detours_suspects', True):
+        return pd.DataFrame()  # Retourner un DataFrame vide si désactivé
+        
     # Paramètres
     seuil_detour_pct = st.session_state.get('ss_seuil_detour_pct', DEFAULT_SEUIL_DETOUR_PCT)
     poids_detour_suspect = st.session_state.get('ss_poids_detour_suspect', DEFAULT_POIDS_DETOUR_SUSPECT)
@@ -2198,7 +2405,10 @@ def generer_resume_anomalies_geolocalisation(
         resume_exces, _ = analyser_exces_vitesse(df_geoloc, date_debut, date_fin, seuil_vitesse_agregation)
 
     with st.spinner("Détection des trajets suspects (agrégation)..."):
-        trajets_suspects = detecter_trajets_suspects(df_geoloc, date_debut, date_fin)
+        if st.session_state.get('ss_activer_trajets_suspects', True):
+            trajets_suspects = detecter_trajets_suspects(df_geoloc, date_debut, date_fin)
+        else:
+            trajets_suspects = pd.DataFrame()
 
     with st.spinner("Analyse des correspondances transactions/géolocalisation (agrégation)..."):
         _, transactions_suspectes = analyser_correspondance_transactions_geoloc(
@@ -2206,7 +2416,10 @@ def generer_resume_anomalies_geolocalisation(
         )
 
     with st.spinner("Détection des détours suspects (agrégation)..."):
-        detours_suspects = detecter_detours_suspects(df_geoloc, date_debut, date_fin)
+        if st.session_state.get('ss_activer_detours_suspects', True):
+            detours_suspects = detecter_detours_suspects(df_geoloc, date_debut, date_fin)
+        else:
+            detours_suspects = pd.DataFrame()
 
     with st.spinner("Analyse comparative distances géoloc/transactions (agrégation)..."):
         comparaison, anomalies_distance = analyser_geolocalisation_vs_transactions(
@@ -2502,9 +2715,9 @@ def afficher_page_analyse_geolocalisation(
 
 
     # Onglets pour différentes analyses
-    tab_synthese, tab_comparaison, tab_vitesse, tab_utilisation, tab_trajets_suspects, tab_carte, tab_integration = st.tabs([
+    tab_synthese, tab_comparaison, tab_vitesse, tab_utilisation, tab_trajets_suspects, tab_vehicules_sans_geoloc, tab_carte, tab_integration = st.tabs([
         "📊 Synthèse", "🔍 Comparaison Carburant", "🚨 Excès de Vitesse", "⚙️ Utilisation",
-        "⚠️ Trajets Suspects", "🗺️ Carte", "🔄 Intégration"
+        "⚠️ Trajets Suspects", "❓ Véhicules Sans Géoloc", "🗺️ Carte", "🔄 Intégration"
     ])
 
     with tab_synthese:
@@ -2577,6 +2790,63 @@ def afficher_page_analyse_geolocalisation(
                 recap_vehicule[col] = recap_vehicule[col].round(1)
 
             afficher_dataframe_avec_export(recap_vehicule, "Récapitulatif par Véhicule (Trajets)", key="geoloc_recap_vehicule_trajets")
+
+    # Ajouter le contenu du nouvel onglet
+    with tab_vehicules_sans_geoloc:
+        st.subheader("Véhicules Sans Données de Géolocalisation")
+        
+        with st.spinner("Analyse des véhicules sans géolocalisation en cours..."):
+            df_vehicules_sans_geoloc = analyser_vehicules_sans_geoloc(
+                df_transactions, df_vehicules, df_geoloc_filtered_orig, date_debut, date_fin
+            )
+        
+        if df_vehicules_sans_geoloc.empty:
+            st.success("✅ Tous les véhicules avec des transactions ont des données de géolocalisation pour la période sélectionnée.")
+        else:
+            nb_vehicules_sans_geoloc = len(df_vehicules_sans_geoloc)
+            nb_total_vehicules_actifs = len(set(df_transactions[df_transactions['Card num.'].isin(df_vehicules['N° Carte'])]['Card num.'].unique()))
+            
+            pourcentage = (nb_vehicules_sans_geoloc / nb_total_vehicules_actifs * 100) if nb_total_vehicules_actifs > 0 else 0
+            
+            st.warning(f"⚠️ {nb_vehicules_sans_geoloc} véhicules ({pourcentage:.1f}% de la flotte active) ont effectué des transactions sans données de géolocalisation correspondantes.")
+            
+            # Afficher les statistiques
+            afficher_dataframe_avec_export(
+                df_vehicules_sans_geoloc,
+                "Véhicules Sans Géolocalisation",
+                key="vehicules_sans_geoloc"
+            )
+            
+            # Graphique des transactions sans géolocalisation
+            fig_sans_geoloc = px.bar(
+                df_vehicules_sans_geoloc,
+                x='Immatriculation',
+                y='Nb_Transactions',
+                title="Nombre de Transactions Sans Géolocalisation par Véhicule",
+                color='Catégorie',
+                hover_data=['Volume_Total_L', 'Montant_Total_CFA', 'Jours_Avec_Transactions']
+            )
+            st.plotly_chart(fig_sans_geoloc, use_container_width=True)
+            
+            # Recommandations
+            st.subheader("Causes Possibles et Recommandations")
+            st.markdown("""
+            ### Causes possibles de l'absence de données de géolocalisation:
+            
+            1. **Équipement non installé**: Certains véhicules peuvent ne pas être équipés de dispositifs de géolocalisation.
+            2. **Défaillance technique**: Problème avec le dispositif GPS ou le système de transmission de données.
+            3. **Désactivation volontaire**: Débranchement ou neutralisation intentionnelle du dispositif.
+            4. **Problème de couverture réseau**: Zones géographiques sans couverture pour la transmission de données.
+            5. **Problème d'identifiant**: Non-correspondance entre l'immatriculation dans les données de transaction et de géolocalisation.
+            
+            ### Recommandations:
+            
+            - **Vérification physique**: Effectuer un contrôle visuel des dispositifs GPS sur les véhicules listés.
+            - **Test de fonctionnement**: Vérifier que les systèmes sont correctement alimentés et configurés.
+            - **Mise à jour des identifiants**: S'assurer que les immatriculations sont identiques dans tous les systèmes.
+            - **Installation manquante**: Équiper les véhicules non pourvus de dispositifs de géolocalisation.
+            - **Formation**: Sensibiliser les conducteurs à l'importance du bon fonctionnement des systèmes de géolocalisation.
+            """)
 
     with tab_comparaison:
         st.subheader("Comparaison Kilométrage Géolocalisation vs. Transactions Carburant")
@@ -3195,10 +3465,12 @@ def detecter_anomalies_geolocalisation(
             }
             anomalies.append(anomalie)
 
-    # 4. Détecter les transactions sans présence
-    _, transactions_sans_presence = analyser_correspondance_transactions_geoloc(
-        df_geoloc_filtered, df_transactions, df_vehicules, date_debut, date_fin
-    )
+    # 4. Détecter les transactions sans présence (si activé)
+    transactions_sans_presence = pd.DataFrame()
+    if st.session_state.get('ss_activer_transactions_sans_presence', True):
+        _, transactions_sans_presence = analyser_correspondance_transactions_geoloc(
+            df_geoloc_filtered, df_transactions, df_vehicules, date_debut, date_fin
+        )
 
     if not transactions_sans_presence.empty:
         for idx, row in transactions_sans_presence.iterrows():
@@ -3430,8 +3702,8 @@ def afficher_page_anomalies(df_transactions: pd.DataFrame, df_vehicules: pd.Data
 
 
     # Afficher les résultats
-    tab_resume, tab_transactions_detail, tab_geoloc_detail = st.tabs([
-        "📊 Résumé Global", "💳 Détail Anomalies Transactions", "📍 Détail Anomalies Géolocalisation"
+    tab_resume, tab_transactions_detail, tab_stations_risque, tab_geoloc_detail = st.tabs([
+        "📊 Résumé Global", "💳 Détail Anomalies Transactions", "🏢 Stations à Risque", "📍 Détail Anomalies Géolocalisation"
     ])
 
     with tab_resume:
@@ -3499,6 +3771,94 @@ def afficher_page_anomalies(df_transactions: pd.DataFrame, df_vehicules: pd.Data
                 cols_display_trans_page = ['Date', 'Hour', 'Nouveau Immat', 'Catégorie', 'type_anomalie', 'detail_anomalie', 'Quantity', 'Amount', 'Place', 'poids_anomalie']
                 cols_final_trans_page = [col for col in cols_display_trans_page if col in df_anomalies_transac.columns]
                 afficher_dataframe_avec_export(df_anomalies_transac[cols_final_trans_page], "Détail Anomalies Transactions (Page)", key="anom_all_transactions_page")
+    
+    # Nouvel onglet pour l'analyse des stations à risque
+    with tab_stations_risque:
+        st.subheader("🏢 Analyse des Stations à Risque de Fraude")
+        
+        if df_anomalies_all.empty:
+            st.success("✅ Aucune anomalie détectée, impossible d'analyser les stations à risque.")
+        else:
+            with st.spinner("Analyse des stations à risque en cours..."):
+                stations_risque = analyser_stations_risque(df_anomalies_all, df_transactions)
+            
+            if stations_risque.empty:
+                st.info("Aucune station n'a présenté d'anomalies liées à la fraude par carte.")
+            else:
+                nb_stations_risque_eleve = len(stations_risque[stations_risque['Niveau_Risque'].isin(['Élevé', 'Critique'])])
+                
+                if nb_stations_risque_eleve > 0:
+                    st.warning(f"⚠️ {nb_stations_risque_eleve} stations présentent un risque élevé ou critique de fraude.")
+                
+                # Afficher les 10 stations les plus à risque
+                cols_display_stations = [
+                    'Place', 'Nb_Anomalies_Fraude', 'Nb_Total_Transactions', 
+                    'Pourcentage_Anomalies', 'Score_Risque_Station', 'Niveau_Risque',
+                    'Anomalies_Principales'
+                ]
+                
+                afficher_dataframe_avec_export(
+                    stations_risque[cols_display_stations],
+                    "Stations à Risque de Fraude",
+                    key="stations_risque_fraude"
+                )
+                
+                # Graphique des stations à risque
+                fig_stations = px.bar(
+                    stations_risque.head(10),
+                    x='Place',
+                    y='Nb_Anomalies_Fraude',
+                    color='Niveau_Risque',
+                    title="Top 10 des Stations à Risque de Fraude",
+                    color_discrete_map={
+                        'Faible': 'green',
+                        'Modéré': 'yellow',
+                        'Élevé': 'orange',
+                        'Critique': 'red'
+                    },
+                    hover_data=['Pourcentage_Anomalies', 'Nb_Total_Transactions', 'Anomalies_Principales']
+                )
+                st.plotly_chart(fig_stations, use_container_width=True)
+                
+                # Carte thermique des types d'anomalies par station (pour les 10 stations les plus à risque)
+                st.subheader("Répartition des Types d'Anomalies par Station")
+                top_stations = stations_risque.head(10)['Place'].tolist()
+                anomalies_heatmap = df_anomalies_all[
+                    (df_anomalies_all['Place'].isin(top_stations)) & 
+                    (df_anomalies_all['type_anomalie'].isin([
+                        'Dépassement capacité', 'Prises rapprochées', 
+                        'Facturation double suspectée', 'Transaction sans présence (géoloc)',
+                        'Véhicule Hors Service'
+                    ]))
+                ]
+                
+                if not anomalies_heatmap.empty:
+                    pivot_heatmap = pd.crosstab(
+                        anomalies_heatmap['Place'], 
+                        anomalies_heatmap['type_anomalie']
+                    )
+                    
+                    fig_heatmap = px.imshow(
+                        pivot_heatmap,
+                        labels=dict(x="Type d'Anomalie", y="Station", color="Nombre"),
+                        title="Distribution des Anomalies par Station",
+                        color_continuous_scale='Reds'
+                    )
+                    st.plotly_chart(fig_heatmap, use_container_width=True)
+                
+                # Recommandations
+                st.subheader("Recommandations pour la Gestion des Risques")
+                st.markdown("""
+                ### Actions recommandées pour les stations à risque élevé:
+                
+                1. **Audit spécifique**: Effectuer des contrôles approfondis des transactions provenant de ces stations.
+                2. **Vérification des procédures**: S'assurer que les procédures de distribution de carburant sont respectées.
+                3. **Rotation du personnel**: Envisager une rotation des pompistes dans les stations à haut risque.
+                4. **Formation**: Organiser des sessions de sensibilisation aux règles et procédures.
+                5. **Contrôles inopinés**: Établir un programme de vérifications surprises.
+                6. **Corrélation avec géolocalisation**: Vérifier systématiquement la présence des véhicules aux heures de transaction.
+                7. **Analyse des tendances**: Surveiller l'évolution des anomalies au fil du temps pour vérifier l'efficacité des mesures.
+                """)
 
     with tab_geoloc_detail:
         if df_geoloc is None or df_geoloc.empty:
@@ -3612,17 +3972,17 @@ def afficher_page_parametres(df_vehicules: Optional[pd.DataFrame] = None):
             st.caption("Ajustez l'importance de chaque type d'anomalie dans le calcul du score de risque.")
             c1, c2, c3 = st.columns(3)
             with c1:
-                st.session_state.ss_poids_conso_excessive = st.slider("Poids: Conso. Excessive", 1, 15, st.session_state.get('ss_poids_conso_excessive', DEFAULT_POIDS_CONSO_EXCESSIVE), key='poids_cex')
-                st.session_state.ss_poids_depassement_capacite = st.slider("Poids: Dépassement Capacité", 1, 15, st.session_state.get('ss_poids_depassement_capacite', DEFAULT_POIDS_DEPASSEMENT_CAPACITE), key='poids_dep')
-                st.session_state.ss_poids_prises_rapprochees = st.slider("Poids: Prises Rapprochées", 1, 15, st.session_state.get('ss_poids_prises_rapprochees', DEFAULT_POIDS_PRISES_RAPPROCHEES), key='poids_rap')
+                st.session_state.ss_poids_conso_excessive = st.slider("Poids: Conso. Excessive", 0, 15, st.session_state.get('ss_poids_conso_excessive', DEFAULT_POIDS_CONSO_EXCESSIVE), key='poids_cex')
+                st.session_state.ss_poids_depassement_capacite = st.slider("Poids: Dépassement Capacité", 0, 15, st.session_state.get('ss_poids_depassement_capacite', DEFAULT_POIDS_DEPASSEMENT_CAPACITE), key='poids_dep')
+                st.session_state.ss_poids_prises_rapprochees = st.slider("Poids: Prises Rapprochées", 0, 15, st.session_state.get('ss_poids_prises_rapprochees', DEFAULT_POIDS_PRISES_RAPPROCHEES), key='poids_rap')
             with c2:
-                st.session_state.ss_poids_km_decroissant = st.slider("Poids: Km Décroissant", 1, 15, st.session_state.get('ss_poids_km_decroissant', DEFAULT_POIDS_KM_DECROISSANT), key='poids_kmd')
-                st.session_state.ss_poids_km_inchange = st.slider("Poids: Km Inchangé", 1, 15, st.session_state.get('ss_poids_km_inchange', DEFAULT_POIDS_KM_INCHANGE), key='poids_kmi')
-                st.session_state.ss_poids_km_saut = st.slider("Poids: Saut Km Important", 1, 15, st.session_state.get('ss_poids_km_saut', DEFAULT_POIDS_KM_SAUT), key='poids_kms')
+                st.session_state.ss_poids_km_decroissant = st.slider("Poids: Km Décroissant", 0, 15, st.session_state.get('ss_poids_km_decroissant', DEFAULT_POIDS_KM_DECROISSANT), key='poids_kmd')
+                st.session_state.ss_poids_km_inchange = st.slider("Poids: Km Inchangé", 0, 15, st.session_state.get('ss_poids_km_inchange', DEFAULT_POIDS_KM_INCHANGE), key='poids_kmi')
+                st.session_state.ss_poids_km_saut = st.slider("Poids: Saut Km Important", 0, 15, st.session_state.get('ss_poids_km_saut', DEFAULT_POIDS_KM_SAUT), key='poids_kms')
             with c3:
-                st.session_state.ss_poids_hors_horaire = st.slider("Poids: Hors Horaires/WE (Transaction)", 1, 15, st.session_state.get('ss_poids_hors_horaire', DEFAULT_POIDS_HORS_HORAIRE), key='poids_hor')
-                st.session_state.ss_poids_hors_service = st.slider("Poids: Véhicule Hors Service", 1, 15, st.session_state.get('ss_poids_hors_service', DEFAULT_POIDS_HORS_SERVICE), key='poids_hsv')
-                st.session_state.ss_poids_fact_double = st.slider("Poids: Facturation Double", 1, 15, st.session_state.get('ss_poids_fact_double', DEFAULT_POIDS_FACT_DOUBLE), key='poids_dbl')
+                st.session_state.ss_poids_hors_horaire = st.slider("Poids: Hors Horaires/WE (Transaction)", 0, 15, st.session_state.get('ss_poids_hors_horaire', DEFAULT_POIDS_HORS_HORAIRE), key='poids_hor')
+                st.session_state.ss_poids_hors_service = st.slider("Poids: Véhicule Hors Service", 0, 15, st.session_state.get('ss_poids_hors_service', DEFAULT_POIDS_HORS_SERVICE), key='poids_hsv')
+                st.session_state.ss_poids_fact_double = st.slider("Poids: Facturation Double", 0, 15, st.session_state.get('ss_poids_fact_double', DEFAULT_POIDS_FACT_DOUBLE), key='poids_dbl')
 
     with tab_geoloc:
         with st.expander("Paramètres Généraux de Géolocalisation", expanded=True):
@@ -3643,12 +4003,49 @@ def afficher_page_parametres(df_vehicules: Optional[pd.DataFrame] = None):
                 step=5, key='param_seuil_detour',
                 help="Un trajet est un détour suspect si sa vitesse moyenne est X% inférieure à la vitesse moyenne habituelle du véhicule pour des trajets significatifs."
             )
+            st.session_state.ss_vitesse_excessive_seuil = st.slider(
+                "Vitesse maximale autorisée (km/h)", min_value=50, max_value=150,
+                value=st.session_state.get('ss_vitesse_excessive_seuil', 90),
+                step=5, key='param_vitesse_max',
+                help="Seuil de vitesse au-delà duquel un trajet est considéré en excès de vitesse."
+            )
             st.session_state.ss_nb_arrets_suspect = st.slider( # Actuellement non utilisé
                 "Nombre d'arrêts Type='Arrêt' suspect pour un trajet court", min_value=2, max_value=10,
                 value=st.session_state.get('ss_nb_arrets_suspect', DEFAULT_NB_ARRETS_SUSPECT),
                 step=1, key='param_nb_arrets_suspect',
                 disabled=True # Logique non implémentée
             )
+
+        with st.expander("Activation/Désactivation des Types d'Anomalies", expanded=True):
+            st.caption("Activez ou désactivez certains types d'anomalies pour ajuster votre analyse.")
+            
+            # Initialiser les paramètres d'activation s'ils n'existent pas
+            if 'ss_activer_trajets_suspects' not in st.session_state:
+                st.session_state['ss_activer_trajets_suspects'] = True  # Activé par défaut
+            
+            if 'ss_activer_detours_suspects' not in st.session_state:
+                st.session_state['ss_activer_detours_suspects'] = True  # Activé par défaut
+            
+            # Créer les cases à cocher pour activer/désactiver
+            st.session_state['ss_activer_trajets_suspects'] = st.checkbox(
+                "Activer la détection des trajets suspects (hors heures, weekend, vitesse lente)",
+                value=st.session_state['ss_activer_trajets_suspects'],
+                help="Désactivez cette option si vous recevez trop d'alertes non pertinentes concernant des trajets hors heures ou weekend."
+            )
+            
+            st.session_state['ss_activer_detours_suspects'] = st.checkbox(
+                "Activer la détection des détours suspects",
+                value=st.session_state['ss_activer_detours_suspects'],
+                help="Désactivez cette option si vous recevez trop d'alertes sur des trajets à vitesse réduite qui ne sont pas nécessairement des détours."
+            )
+            
+            st.session_state['ss_activer_transactions_sans_presence'] = st.checkbox(
+                "Activer la détection des transactions sans présence",
+                value=st.session_state['ss_activer_transactions_sans_presence'],
+                help="Désactivez cette option si vous ne souhaitez pas détecter les transactions effectuées sans présence du véhicule à la station."
+            )
+            
+            st.info("Astuce: Vous pouvez également définir les poids de ces anomalies à 0 dans la section 'Poids des Anomalies de Géolocalisation' si vous préférez simplement les exclure du calcul du score de risque mais continuer à les voir dans les rapports.")
 
         with st.expander("Heures de Service (Géolocalisation)"):
             st.session_state.ss_heure_debut_service = st.slider(
@@ -3703,7 +4100,7 @@ def afficher_page_parametres(df_vehicules: Optional[pd.DataFrame] = None):
     st.markdown("---")
     st.info("Les paramètres sont sauvegardés automatiquement pendant la session.")
 
-def afficher_page_analyse_vehicules(df_transactions: pd.DataFrame, df_vehicules: pd.DataFrame, date_debut: datetime.date, date_fin: datetime.date, kpi_cat: pd.DataFrame):
+def afficher_page_analyse_vehicules(df_transactions: pd.DataFrame, df_vehicules: pd.DataFrame, date_debut: datetime.date, date_fin: datetime.date, kpi_cat: pd.DataFrame, df_geoloc: Optional[pd.DataFrame] = None):
     """Affiche la page d'analyse détaillée des véhicules."""
     st.header(f"🚗 Analyse Détaillée des Véhicules ({date_debut.strftime('%d/%m/%Y')} - {date_fin.strftime('%d/%m/%Y')})")
 
@@ -3714,7 +4111,6 @@ def afficher_page_analyse_vehicules(df_transactions: pd.DataFrame, df_vehicules:
     # Filtre par véhicule
     all_vehicles = sorted(df_vehicules['Nouveau Immat'].dropna().unique())
     selected_vehicle = st.selectbox("Sélectionner un véhicule", ["Tous"] + all_vehicles, key="select_veh_analyse")
-
 
     if selected_vehicle != "Tous":
         # Obtenir les informations du véhicule
@@ -3747,9 +4143,9 @@ def afficher_page_analyse_vehicules(df_transactions: pd.DataFrame, df_vehicules:
 
         # Statistiques des transactions
         if not vehicle_transactions.empty:
-            total_volume_veh = vehicle_transactions['Quantity'].sum() # Renommé
-            total_amount_veh = vehicle_transactions['Amount'].sum() # Renommé
-            nb_transactions_veh = len(vehicle_transactions) # Renommé
+            total_volume_veh = vehicle_transactions['Quantity'].sum()
+            total_amount_veh = vehicle_transactions['Amount'].sum()
+            nb_transactions_veh = len(vehicle_transactions)
 
             st.subheader("Statistiques de Consommation")
             col4, col5, col6 = st.columns(3)
@@ -3757,7 +4153,186 @@ def afficher_page_analyse_vehicules(df_transactions: pd.DataFrame, df_vehicules:
             col5.metric("Montant Total", f"{total_amount_veh:,.0f} CFA")
             col6.metric("Nombre de Transactions", f"{nb_transactions_veh}")
 
-            # Afficher les transactions
+            # NOUVEAU: Ajout d'une section pour les stations fréquentées
+            st.subheader("Stations Fréquentées")
+            
+            # Analyser les stations fréquentées
+            stations_frequentees = vehicle_transactions.groupby('Place').agg(
+                Nb_Transactions=('Quantity', 'count'),
+                Volume_Total=('Quantity', 'sum'),
+                Montant_Total=('Amount', 'sum'),
+                Premiere_Visite=('Date', 'min'),
+                Derniere_Visite=('Date', 'max')
+            ).reset_index()
+            
+            # Calculer le prix moyen par litre par station
+            stations_frequentees['Prix_Moyen_Litre'] = np.where(
+                stations_frequentees['Volume_Total'] > 0,
+                stations_frequentees['Montant_Total'] / stations_frequentees['Volume_Total'],
+                0
+            )
+            
+            # Calculer le pourcentage du volume total
+            volume_total_veh = stations_frequentees['Volume_Total'].sum()
+            stations_frequentees['Pourcentage_Volume'] = np.where(
+                volume_total_veh > 0,
+                (stations_frequentees['Volume_Total'] / volume_total_veh) * 100,
+                0
+            )
+            
+            # Arrondir les valeurs numériques
+            for col in ['Volume_Total', 'Prix_Moyen_Litre', 'Pourcentage_Volume']:
+                stations_frequentees[col] = stations_frequentees[col].round(1)
+            stations_frequentees['Montant_Total'] = stations_frequentees['Montant_Total'].round(0)
+            
+            # Trier par nombre de transactions décroissant
+            stations_frequentees = stations_frequentees.sort_values('Nb_Transactions', ascending=False)
+            
+            # Calculer la station principale (plus grand volume)
+            station_principale = stations_frequentees.iloc[0]['Place'] if not stations_frequentees.empty else "N/A"
+            pourc_station_principale = stations_frequentees.iloc[0]['Pourcentage_Volume'] if not stations_frequentees.empty else 0
+            
+            col_s1, col_s2 = st.columns(2)
+            col_s1.metric("Station Principale", station_principale)
+            col_s2.metric("% du Volume Total", f"{pourc_station_principale:.1f}%")
+            
+            # Afficher le tableau des stations
+            afficher_dataframe_avec_export(
+                stations_frequentees,
+                "Stations Fréquentées",
+                key=f"stations_frequentees_{selected_vehicle.replace(' ', '_')}"
+            )
+            
+            # Graphique de répartition des volumes par station
+            fig_stations = px.pie(
+                stations_frequentees.head(5),  # Top 5 des stations
+                values='Volume_Total',
+                names='Place',
+                title=f"Répartition du Volume par Station - Top 5 ({selected_vehicle})",
+                hole=0.4  # Style donut
+            )
+            st.plotly_chart(fig_stations, use_container_width=True)
+            
+            # Vérifier s'il y a des anomalies spécifiques à certaines stations
+            if 'all_anomalies_veh' in locals() and not all_anomalies_veh.empty and 'Place' in all_anomalies_veh.columns:
+                anomalies_par_station = all_anomalies_veh.groupby('Place').agg(
+                    Nb_Anomalies=('type_anomalie', 'count'),
+                    Types_Anomalies=('type_anomalie', lambda x: ', '.join(sorted(set(x))))
+                ).reset_index()
+                
+                if not anomalies_par_station.empty:
+                    st.subheader("Anomalies par Station")
+                    st.dataframe(anomalies_par_station, use_container_width=True)
+                    
+                    # Graphique des anomalies par station
+                    fig_anomalies_station = px.bar(
+                        anomalies_par_station,
+                        x='Place',
+                        y='Nb_Anomalies',
+                        title=f"Anomalies par Station pour {selected_vehicle}",
+                        hover_data=['Types_Anomalies']
+                    )
+                    st.plotly_chart(fig_anomalies_station, use_container_width=True)
+            
+            # NOUVEAU: Récupération et affichage des anomalies
+            # Détecter les anomalies de transaction pour ce véhicule
+            df_anomalies_veh = detecter_anomalies(vehicle_transactions, df_vehicules[df_vehicules['N° Carte'] == vehicle_card])
+            
+            # Ajouter les anomalies de géolocalisation si disponibles
+            anomalies_geoloc_veh = pd.DataFrame()
+            if df_geoloc is not None and not df_geoloc.empty:
+                anomalies_geoloc_veh = detecter_anomalies_geolocalisation(
+                    df_geoloc, vehicle_transactions, 
+                    df_vehicules[df_vehicules['Nouveau Immat'] == selected_vehicle], 
+                    date_debut, date_fin
+                )
+            
+            # Fusionner toutes les anomalies
+            if not df_anomalies_veh.empty and not anomalies_geoloc_veh.empty:
+                # Assurez-vous que les colonnes nécessaires existent dans les deux dataframes
+                common_cols = ['Date', 'Card num.', 'Nouveau Immat', 'type_anomalie', 'detail_anomalie', 'poids_anomalie']
+                for col in common_cols:
+                    if col not in df_anomalies_veh.columns: df_anomalies_veh[col] = None
+                    if col not in anomalies_geoloc_veh.columns: anomalies_geoloc_veh[col] = None
+                
+                all_anomalies_veh = pd.concat([
+                    df_anomalies_veh[common_cols],
+                    anomalies_geoloc_veh[common_cols]
+                ], ignore_index=True)
+            elif not df_anomalies_veh.empty:
+                all_anomalies_veh = df_anomalies_veh
+            elif not anomalies_geoloc_veh.empty:
+                all_anomalies_veh = anomalies_geoloc_veh
+            else:
+                all_anomalies_veh = pd.DataFrame()
+            
+            # Affichage du score de risque
+            if not all_anomalies_veh.empty:
+                # Calcul du score de risque
+                score_risque_veh = calculer_score_risque(all_anomalies_veh)
+                if not score_risque_veh.empty:
+                    st.subheader("⚠️ Score de Risque")
+                    score_row = score_risque_veh.iloc[0]
+                    col_score1, col_score2, col_score3 = st.columns(3)
+                    col_score1.metric("Score de Risque", f"{score_row['score_risque']:.1f}")
+                    col_score2.metric("Nombre d'Anomalies", f"{score_row['nombre_total_anomalies']}")
+                    
+                    # Déterminer le niveau de risque
+                    niveau_risque = "Faible"
+                    if score_row['score_risque'] >= 40:
+                        niveau_risque = "Critique"
+                    elif score_row['score_risque'] >= 20:
+                        niveau_risque = "Élevé"
+                    elif score_row['score_risque'] >= 10:
+                        niveau_risque = "Modéré"
+                    col_score3.metric("Niveau de Risque", niveau_risque)
+                
+                # Résumé des anomalies par type
+                st.subheader("Résumé des Anomalies Détectées")
+                resume_anomalies_veh = all_anomalies_veh.groupby('type_anomalie').agg(
+                    Nombre=('type_anomalie', 'count'),
+                    Score_Total=('poids_anomalie', 'sum'),
+                    Score_Moyen=('poids_anomalie', 'mean')
+                ).reset_index().sort_values('Score_Total', ascending=False)
+                
+                st.dataframe(resume_anomalies_veh, use_container_width=True)
+                
+                # Graphique des types d'anomalies
+                fig_anomalies_veh = px.bar(
+                    resume_anomalies_veh,
+                    x='type_anomalie', y='Nombre',
+                    title=f"Anomalies Détectées pour {selected_vehicle}",
+                    color='Score_Total',
+                    labels={'type_anomalie': "Type d'Anomalie", 'Nombre': "Nombre d'occurrences"}
+                )
+                st.plotly_chart(fig_anomalies_veh, use_container_width=True)
+                
+                # Détail de toutes les anomalies
+                with st.expander("Détail de toutes les anomalies", expanded=True):
+                    # Convertir la date en datetime si ce n'est pas déjà fait
+                    if 'Date' in all_anomalies_veh.columns and not pd.api.types.is_datetime64_any_dtype(all_anomalies_veh['Date']):
+                        all_anomalies_veh['Date'] = pd.to_datetime(all_anomalies_veh['Date'])
+                    
+                    # Trier par date et poids d'anomalie
+                    all_anomalies_veh_sorted = all_anomalies_veh.sort_values(['Date', 'poids_anomalie'], ascending=[True, False])
+                    
+                    # Sélectionner et afficher les colonnes pertinentes
+                    cols_display = ['Date', 'type_anomalie', 'detail_anomalie', 'poids_anomalie']
+                    # Ajouter les colonnes spécifiques si elles existent
+                    optional_cols = ['Quantity', 'Amount', 'Place', 'Hour', 'Past mileage', 'Current mileage']
+                    for col in optional_cols:
+                        if col in all_anomalies_veh_sorted.columns:
+                            cols_display.append(col)
+                    
+                    afficher_dataframe_avec_export(
+                        all_anomalies_veh_sorted[cols_display],
+                        f"Anomalies Détectées - {selected_vehicle}",
+                        key=f"anomalies_{selected_vehicle}"
+                    )
+            else:
+                st.success("✅ Aucune anomalie détectée pour ce véhicule sur la période sélectionnée.")
+
+            # Afficher les transactions (inchangé)
             st.subheader("Transactions du Véhicule")
             afficher_dataframe_avec_export(
                 vehicle_transactions,
@@ -3765,27 +4340,57 @@ def afficher_page_analyse_vehicules(df_transactions: pd.DataFrame, df_vehicules:
                 key=f"vehicle_transactions_{selected_vehicle.replace(' ', '_')}"
             )
 
-            # Graphique d'évolution de la consommation
+            # Graphique d'évolution de la consommation (inchangé)
             st.subheader("Évolution de la Consommation")
-            # Utiliser 'Date' qui est déjà datetime, pas besoin de créer 'date'
             daily_consumption = vehicle_transactions.groupby(vehicle_transactions['Date'].dt.date)['Quantity'].sum().reset_index()
-
 
             fig = px.line(
                 daily_consumption,
-                x='Date', # 'Date' est déjà la colonne de date
+                x='Date',
                 y='Quantity',
                 title="Évolution de la Consommation Quotidienne",
                 labels={'Date': 'Date', 'Quantity': 'Volume (L)'}
             )
             st.plotly_chart(fig, use_container_width=True)
+            
+            # NOUVEAU: Ajouter des visualisations spécifiques si données géoloc disponibles
+            if df_geoloc is not None and not df_geoloc.empty:
+                mask_geoloc_veh = df_geoloc['Véhicule'] == selected_vehicle
+                df_geoloc_veh = df_geoloc[mask_geoloc_veh]
+                
+                if not df_geoloc_veh.empty:
+                    st.subheader("Données de Géolocalisation")
+                    
+                    # Statistiques de géolocalisation
+                    trajets_veh = df_geoloc_veh[df_geoloc_veh['Type'] == 'Trajet']
+                    if not trajets_veh.empty:
+                        col_geo1, col_geo2, col_geo3 = st.columns(3)
+                        col_geo1.metric("Nombre de Trajets", f"{len(trajets_veh)}")
+                        col_geo1.metric("Distance Totale", f"{trajets_veh['Distance'].sum():.1f} km")
+                        
+                        if 'Durée_minutes' in trajets_veh.columns:
+                            duree_heures = trajets_veh['Durée_minutes'].sum() / 60
+                            col_geo2.metric("Durée Totale", f"{duree_heures:.1f} h")
+                        
+                        if 'Vitesse moyenne' in trajets_veh.columns:
+                            col_geo2.metric("Vitesse Moyenne", f"{trajets_veh['Vitesse moyenne'].mean():.1f} km/h")
+                            col_geo3.metric("Vitesse Max", f"{trajets_veh['Vitesse moyenne'].max():.1f} km/h")
+                        
+                        # Visualiser les 5 derniers trajets
+                        with st.expander("Visualiser les derniers trajets"):
+                            derniers_trajets = trajets_veh.sort_values('Date', ascending=False).head(5)
+                            st.dataframe(derniers_trajets[['Date', 'Début', 'Fin', 'Distance', 'Durée_minutes', 'Vitesse moyenne']])
+                        
+                        # Option pour voir la carte
+                        if st.button("Afficher la carte des trajets"):
+                            visualiser_trajets_sur_carte(
+                                df_geoloc, selected_vehicle, date_debut, date_fin, highlight_anomalies=True
+                            )
+                    else:
+                        st.info("Aucune donnée de trajet disponible pour ce véhicule.")
         else:
             st.info(f"Aucune transaction trouvée pour le véhicule {selected_vehicle} durant la période sélectionnée.")
     else:
-        # Vue globale de tous les véhicules
-        st.subheader("Vue d'Ensemble des Véhicules")
-
-        # Afficher les KPIs par catégorie si disponibles
         if not kpi_cat.empty:
             st.write("Consommation moyenne par catégorie de véhicule:")
             afficher_dataframe_avec_export(kpi_cat, "KPIs par Catégorie (Vue Globale)", key="kpi_cat_overview_page")
@@ -4232,13 +4837,13 @@ def main():
         )
         afficher_page_dashboard(df_transac_filtered, df_vehicules, df_ge, df_autres, global_date_debut, global_date_fin, df_geoloc)
         ameliorer_dashboard(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin, 
-                        kpi_cat_dashboard, df_vehicle_kpi_dashboard)
+                        kpi_cat_dashboard, df_vehicle_kpi_dashboard, df_geoloc)
     elif page == "Analyse Véhicules":
          kpi_cat_veh_page, _ = calculer_kpis_globaux(
              df_transac_filtered, df_vehicules, global_date_debut, global_date_fin,
              list(st.session_state.ss_conso_seuils_par_categorie.keys()) 
          )
-         afficher_page_analyse_vehicules(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin, kpi_cat_veh_page)
+         afficher_page_analyse_vehicules(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin, kpi_cat_veh_page, df_geoloc)
     elif page == "Analyse des Coûts":
          afficher_page_analyse_couts(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin)
     elif page == "Analyse par Période":
