@@ -882,17 +882,37 @@ def calculer_distance_et_consommation(df_transactions: pd.DataFrame) -> Tuple[fl
     if df_transactions.empty or len(df_transactions) < 2:
         return 0.0, 0.0, 0.0, "insuffisant"
 
+    # Trier d'abord par date/heure pour s'assurer de l'ordre chronologique
+    df_sorted = df_transactions.sort_values('DateTime')
+    
     # Méthode simple: différence entre premier et dernier kilométrage
-    df_km = df_transactions[['Past mileage', 'Current mileage']].dropna()
     distance_simple = 0.0
-    if not df_km.empty and len(df_km) > 1:
-        first_km = df_km['Past mileage'].iloc[0]
-        last_km = df_km['Current mileage'].iloc[-1]
-        if pd.notna(first_km) and pd.notna(last_km) and last_km > first_km:
-            distance_simple = last_km - first_km
+    
+    # Trouver le premier kilométrage valide dans la première transaction
+    df_first = df_sorted.head(int(len(df_sorted) * 0.2) or 1)  # Prendre les 20% premières transactions ou au moins 1
+    for idx, row in df_first.iterrows():
+        if pd.notna(row['Past mileage']):
+            first_km = row['Past mileage']
+            break
+    else:
+        # Si aucun Past mileage valide n'est trouvé dans les premières transactions
+        first_km = None
+    
+    # Trouver le dernier kilométrage valide dans la dernière transaction
+    df_last = df_sorted.tail(int(len(df_sorted) * 0.2) or 1)  # Prendre les 20% dernières transactions ou au moins 1
+    for idx, row in df_last.iloc[::-1].iterrows():  # Parcourir en sens inverse
+        if pd.notna(row['Current mileage']):
+            last_km = row['Current mileage']
+            break
+    else:
+        # Si aucun Current mileage valide n'est trouvé dans les dernières transactions
+        last_km = None
+    
+    # Calculer la distance simple si les deux valeurs sont disponibles
+    if first_km is not None and last_km is not None and last_km > first_km:
+        distance_simple = last_km - first_km
 
     # Méthode cumulative: somme des distances valides entre transactions
-    df_sorted = df_transactions.sort_values('DateTime')
     distances_valides = []
     for i in range(len(df_sorted)):
         curr_row = df_sorted.iloc[i]
