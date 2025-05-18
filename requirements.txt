@@ -8,3 +8,5 @@ PyPDF2
 haversine
 folium
 streamlit-folium
+python-pptx
+Pillow
