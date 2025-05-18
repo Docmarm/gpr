@@ -1003,9 +1003,20 @@ def calculer_kpis_globaux(df_transactions: pd.DataFrame, df_vehicules: pd.DataFr
 def calculer_score_risque(df_anomalies: pd.DataFrame) -> pd.DataFrame:
     """Calcule un score de risque pondéré par véhicule basé sur les anomalies."""
     if df_anomalies.empty or 'poids_anomalie' not in df_anomalies.columns:
-        return pd.DataFrame(columns=['Nouveau Immat', 'Card num.', 'Catégorie', 'Nombre total anomalies', 'Score de risque'])
-
-    pivot = df_anomalies.groupby(['Nouveau Immat', 'Card num.', 'Catégorie', 'type_anomalie']).agg(
+        return pd.DataFrame(columns=['Nouveau Immat', 'Card num.', 'Catégorie', 'nombre_total_anomalies', 'score_risque'])
+    
+    # Vérifier si la colonne 'Catégorie' existe, sinon l'ajouter avec une valeur par défaut
+    if 'Catégorie' not in df_anomalies.columns:
+        df_anomalies = df_anomalies.copy()
+        df_anomalies['Catégorie'] = 'Non définie'
+    
+    # Vérifier les colonnes nécessaires pour le groupby
+    groupby_cols = ['Nouveau Immat', 'Card num.', 'Catégorie', 'type_anomalie']
+    for col in groupby_cols:
+        if col not in df_anomalies.columns:
+            df_anomalies[col] = None
+    
+    pivot = df_anomalies.groupby(groupby_cols).agg(
         nombre=('type_anomalie', 'size'),
         score_partiel=('poids_anomalie', 'sum')
     ).reset_index()
