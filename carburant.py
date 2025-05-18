@@ -843,6 +843,68 @@ def generer_rapport_vehicule(donnees_vehicule: pd.DataFrame, info_vehicule: pd.S
     return infos_base, stats_conso, analyse['conso_mensuelle'], analyse['stations_frequentes'], analyse
 
 
+def calculer_distance_et_consommation(df_transactions: pd.DataFrame) -> Tuple[float, float, float, str]:
+    """Calcule la distance parcourue et la consommation en utilisant différentes méthodes.
+
+    Args:
+        df_transactions: DataFrame des transactions triées par date
+
+    Returns:
+        Tuple contenant:
+        - distance_simple: Distance calculée par différence première/dernière transaction
+        - distance_cumulative: Distance calculée en sommant les distances entre transactions
+        - consommation_recommandee: Consommation calculée avec la méthode la plus fiable
+        - methode_utilisee: Méthode utilisée pour le calcul ('simple', 'cumulative', 'hybride', 'insuffisant')
+    """
+    if df_transactions.empty or len(df_transactions) < 2:
+        return 0.0, 0.0, 0.0, "insuffisant"
+
+    # Méthode simple: différence entre premier et dernier kilométrage
+    df_km = df_transactions[['Past mileage', 'Current mileage']].dropna()
+    distance_simple = 0.0
+    if not df_km.empty and len(df_km) > 1:
+        first_km = df_km['Past mileage'].iloc[0]
+        last_km = df_km['Current mileage'].iloc[-1]
+        if pd.notna(first_km) and pd.notna(last_km) and last_km > first_km:
+            distance_simple = last_km - first_km
+
+    # Méthode cumulative: somme des distances valides entre transactions
+    df_sorted = df_transactions.sort_values('DateTime')
+    distances_valides = []
+    for i in range(len(df_sorted)):
+        curr_row = df_sorted.iloc[i]
+        if pd.notna(curr_row['Past mileage']) and pd.notna(curr_row['Current mileage']):
+            dist = curr_row['Current mileage'] - curr_row['Past mileage']
+            if dist > 0 and dist < 1000:  # Filtre basique pour les distances aberrantes
+                distances_valides.append(dist)
+    distance_cumulative = sum(distances_valides)
+
+    # Choisir la méthode la plus appropriée
+    if distance_simple == 0 and distance_cumulative == 0:
+        return 0.0, 0.0, 0.0, "insuffisant"
+
+    # Si les deux méthodes donnent des résultats similaires (écart < 10%)
+    if distance_simple > 0 and distance_cumulative > 0:
+        max_dist = max(distance_simple, distance_cumulative)
+        min_dist = min(distance_simple, distance_cumulative)
+        if (max_dist - min_dist) / max_dist < 0.1:  # Écart < 10%
+            distance_utilisee = (distance_simple + distance_cumulative) / 2
+            methode = "hybride"
+        else:
+            # Utiliser la méthode cumulative si disponible, sinon la méthode simple
+            distance_utilisee = distance_cumulative if distance_cumulative > 0 else distance_simple
+            methode = "cumulative" if distance_cumulative > 0 else "simple"
+    else:
+        # Utiliser la méthode non nulle
+        distance_utilisee = distance_cumulative if distance_cumulative > 0 else distance_simple
+        methode = "cumulative" if distance_cumulative > 0 else "simple"
+
+    # Calculer la consommation
+    volume_total = df_transactions['Quantity'].sum()
+    consommation = (volume_total / distance_utilisee * 100) if distance_utilisee > 0 else 0.0
+
+    return distance_simple, distance_cumulative, consommation, methode
+
 def calculer_kpis_globaux(df_transactions: pd.DataFrame, df_vehicules: pd.DataFrame, date_debut: datetime.date, date_fin: datetime.date, selected_categories: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Calcule les KPIs de consommation et de coût par catégorie et véhicule."""
     # S'assurer que Dotation est présente dans df_vehicules pour les fusions futures si besoin
@@ -874,19 +936,24 @@ def calculer_kpis_globaux(df_transactions: pd.DataFrame, df_vehicules: pd.DataFr
         nb_prises = len(group)
         dotation_mensuelle = group['Dotation'].iloc[0] if 'Dotation' in group.columns else 0
 
+        # Utiliser les deux méthodes de calcul de distance
+        distance_simple, distance_cumulative, consommation_recommandee, methode_utilisee = calculer_distance_et_consommation(group)
+        
+        # Choisir la distance à utiliser (prendre la plus grande par défaut)
+        distance_utilisee = max(distance_simple, distance_cumulative)
+        
+        # Si aucune méthode n'a fonctionné, essayer l'ancienne méthode comme fallback
+        if distance_utilisee == 0:
+            group_km = group[['Past mileage', 'Current mileage']].dropna()
+            if not group_km.empty and len(group_km) > 1:
+                first_km = group_km['Past mileage'].iloc[0]
+                last_km = group_km['Current mileage'].iloc[-1]
+                if pd.notna(first_km) and pd.notna(last_km) and last_km > first_km:
+                    distance_utilisee = last_km - first_km
+                    methode_utilisee = "legacy"
 
-        group_km = group[['Past mileage', 'Current mileage']].dropna()
-        dist = 0
-        if not group_km.empty and len(group_km) > 1:
-             first_km = group_km['Past mileage'].iloc[0]
-             last_km = group_km['Current mileage'].iloc[-1]
-             if pd.notna(first_km) and pd.notna(last_km) and last_km > first_km:
-                 dist = last_km - first_km
-        group['dist_transac'] = group['Current mileage'] - group['Past mileage']
-        dist_sum_valid = group.loc[group['dist_transac'] > 0, 'dist_transac'].sum()
-        distance_utilisee = max(dist, dist_sum_valid)
-
-        cons = (total_lit / distance_utilisee) * 100 if distance_utilisee > 0 else np.nan
+        # Calculer les KPIs basés sur la distance
+        cons = consommation_recommandee if methode_utilisee != "insuffisant" else np.nan
         cpk = (total_amount / distance_utilisee) if distance_utilisee > 0 else np.nan
         avg_price_liter = (total_amount / total_lit) if total_lit > 0 else np.nan
 
@@ -895,7 +962,10 @@ def calculer_kpis_globaux(df_transactions: pd.DataFrame, df_vehicules: pd.DataFr
             'total_litres': total_lit, 'total_cout': total_amount,
             'distance': distance_utilisee, 'consommation': cons, 'cout_par_km': cpk,
             'nb_prises': nb_prises, 'prix_moyen_litre': avg_price_liter,
-            'Dotation': dotation_mensuelle # Ajout de la dotation ici
+            'Dotation': dotation_mensuelle,
+            'distance_simple': distance_simple,  # Nouvelles colonnes pour les deux méthodes
+            'distance_cumulative': distance_cumulative,
+            'methode_distance': methode_utilisee
         })
     df_vehicle_kpi = pd.DataFrame(vehicle_data)
     if df_vehicle_kpi.empty:
@@ -1125,6 +1195,16 @@ def afficher_page_analyse_periodes(df_transactions: pd.DataFrame, df_vehicules: 
     """Affiche la page d'analyse de consommation par période."""
     st.header(f"📅 Analyse de Consommation par Période ({date_debut.strftime('%d/%m/%Y')} - {date_fin.strftime('%d/%m/%Y')})")
 
+    # Fonction interne pour l'analyse de période personnalisée
+    def analyser_consommation_par_periode_custom(df_trans, df_vehs, date_deb, date_fin, selected_categories=None, selected_vehicles=None):
+        """Analyse la consommation pour une période personnalisée."""
+        # Utiliser la même logique que analyser_consommation_par_periode mais avec période journalière
+        return analyser_consommation_par_periode(
+            df_trans, df_vehs, date_deb, date_fin,
+            periode='D', selected_categories=selected_categories,
+            selected_vehicles=selected_vehicles
+        )
+
     if df_transactions.empty:
         st.warning("Aucune transaction à analyser pour la période sélectionnée.")
         return
@@ -1132,12 +1212,47 @@ def afficher_page_analyse_periodes(df_transactions: pd.DataFrame, df_vehicules: 
     st.subheader("Configuration de l'Analyse")
     col_config1, col_config2 = st.columns(2)
     with col_config1:
-        periode_options = {'Jour': 'D','Semaine': 'W','Mois': 'M','Trimestre': 'Q','Année': 'Y'}
+        periode_options = {
+            'Personnalisée': 'CUSTOM',
+            'Jour': 'D',
+            'Semaine': 'W',
+            'Mois': 'M',
+            'Trimestre': 'Q',
+            'Année': 'Y'
+        }
         periode_label = st.selectbox(
             "Sélectionner la période d'analyse :",
-            options=list(periode_options.keys()),index=2
+            options=list(periode_options.keys()),
+            index=0
         )
         periode_code = periode_options[periode_label]
+        
+        # Gestion de la période personnalisée
+        if periode_code == 'CUSTOM':
+            col_date1, col_date2 = st.columns(2)
+            with col_date1:
+                custom_date_debut = st.date_input(
+                    "Date de début personnalisée",
+                    value=date_debut,
+                    min_value=date_debut,
+                    max_value=date_fin,
+                    key="custom_date_debut_periode"
+                )
+            with col_date2:
+                custom_date_fin = st.date_input(
+                    "Date de fin personnalisée",
+                    value=date_fin,
+                    min_value=custom_date_debut,
+                    max_value=date_fin,
+                    key="custom_date_fin_periode"
+                )
+            
+            if custom_date_debut > custom_date_fin:
+                st.error("La date de début ne peut pas être postérieure à la date de fin.")
+                return
+            
+            date_debut = custom_date_debut
+            date_fin = custom_date_fin
     with col_config2:
         all_cats = sorted(df_vehicules['Catégorie'].dropna().astype(str).unique())
         selected_cats = st.multiselect(
@@ -1155,11 +1270,20 @@ def afficher_page_analyse_periodes(df_transactions: pd.DataFrame, df_vehicules: 
         )
 
     with st.spinner(f"Analyse {periode_label.lower()} en cours..."):
-        conso_periode, conso_veh_periode = analyser_consommation_par_periode(
-            df_transactions, df_vehicules, date_debut, date_fin,
-            periode=periode_code, selected_categories=selected_cats,
-            selected_vehicles=selected_vehicles if selected_vehicles else None
-        )
+        if periode_code == 'CUSTOM':
+            # Pour période personnalisée
+            conso_periode, conso_veh_periode = analyser_consommation_par_periode_custom(
+                df_transactions, df_vehicules, date_debut, date_fin,
+                selected_categories=selected_cats,
+                selected_vehicles=selected_vehicles if selected_vehicles else None
+            )
+        else:
+            # Pour les périodes standards
+            conso_periode, conso_veh_periode = analyser_consommation_par_periode(
+                df_transactions, df_vehicules, date_debut, date_fin,
+                periode=periode_code, selected_categories=selected_cats,
+                selected_vehicles=selected_vehicles if selected_vehicles else None
+            )
 
     if conso_periode.empty or conso_veh_periode.empty:
         st.warning(f"Données insuffisantes pour l'analyse {periode_label.lower()}.")
