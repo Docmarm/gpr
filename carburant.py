@@ -6759,6 +6759,44 @@ def afficher_page_parametres(df_vehicules: Optional[pd.DataFrame] = None):
                 disabled=True # Logique non implémentée
             )
 
+        # Nouvelle section pour les poids des anomalies de géolocalisation
+        with st.expander("Poids des Anomalies de Géolocalisation pour Score de Risque", expanded=True):
+            st.caption("Ajustez l'importance de chaque type d'anomalie de géolocalisation dans le calcul du score.")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.session_state.ss_poids_trajet_hors_heures = st.slider(
+                    "Poids: Trajet Hors Heures", 0, 15, 
+                    st.session_state.get('ss_poids_trajet_hors_heures', DEFAULT_POIDS_TRAJET_HORS_HEURES), 
+                    key='poids_trajet_hh'
+                )
+                st.session_state.ss_poids_trajet_weekend = st.slider(
+                    "Poids: Trajet Weekend", 0, 15, 
+                    st.session_state.get('ss_poids_trajet_weekend', DEFAULT_POIDS_TRAJET_WEEKEND), 
+                    key='poids_trajet_we'
+                )
+            with c2:
+                st.session_state.ss_poids_arrets_frequents = st.slider(
+                    "Poids: Arrêts Fréquents", 0, 15, 
+                    st.session_state.get('ss_poids_arrets_frequents', DEFAULT_POIDS_ARRETS_FREQUENTS), 
+                    key='poids_arrets_freq'
+                )
+                st.session_state.ss_poids_detour_suspect = st.slider(
+                    "Poids: Détour Suspect", 0, 15, 
+                    st.session_state.get('ss_poids_detour_suspect', DEFAULT_POIDS_DETOUR_SUSPECT), 
+                    key='poids_detour_susp'
+                )
+            with c3:
+                st.session_state.ss_poids_transaction_sans_presence = st.slider(
+                    "Poids: Transaction Sans Présence", 0, 15, 
+                    st.session_state.get('ss_poids_transaction_sans_presence', DEFAULT_POIDS_TRANSACTION_SANS_PRESENCE), 
+                    key='poids_trans_sp'
+                )
+                st.session_state.ss_poids_vitesse_excessive = st.slider(
+                    "Poids: Vitesse Excessive", 0, 15, 
+                    st.session_state.get('ss_poids_vitesse_excessive', DEFAULT_POIDS_VITESSE_EXCESSIVE), 
+                    key='poids_vitesse_exc'
+                )
+
         with st.expander("Activation/Désactivation des Types d'Anomalies", expanded=True):
             st.caption("Activez ou désactivez certains types d'anomalies pour ajuster votre analyse.")
             
@@ -6768,6 +6806,9 @@ def afficher_page_parametres(df_vehicules: Optional[pd.DataFrame] = None):
             
             if 'ss_activer_detours_suspects' not in st.session_state:
                 st.session_state['ss_activer_detours_suspects'] = True  # Activé par défaut
+                
+            if 'ss_activer_transactions_sans_presence' not in st.session_state:
+                st.session_state['ss_activer_transactions_sans_presence'] = True  # Activé par défaut
             
             # Créer les cases à cocher pour activer/désactiver
             st.session_state['ss_activer_trajets_suspects'] = st.checkbox(
@@ -6778,9 +6819,15 @@ def afficher_page_parametres(df_vehicules: Optional[pd.DataFrame] = None):
             
             st.session_state['ss_activer_detours_suspects'] = st.checkbox(
                 "Activer les détours suspects",
-                                value=st.session_state['ss_activer_detours_suspects'],
-                                help="Ajoutez ici le texte d'aide pour les détours suspects."
-                            )
+                value=st.session_state['ss_activer_detours_suspects'],
+                help="Détecte les trajets avec des vitesses anormalement basses par rapport aux moyennes du véhicule."
+            )
+            
+            st.session_state['ss_activer_transactions_sans_presence'] = st.checkbox(
+                "Activer la détection des transactions sans présence",
+                value=st.session_state['ss_activer_transactions_sans_presence'],
+                help="Détecte les transactions carburant où le véhicule n'était pas présent selon la géolocalisation."
+            )
             
     with tab_bilan_carbone:
         st.subheader("Paramètres de calcul du bilan carbone")
