@@ -491,7 +491,6 @@ def verifier_cartes_inconnues(df_transactions: pd.DataFrame, df_vehicules: pd.Da
     stats = stats[['Card num.', 'Card name', 'Nombre_transactions', 'Volume_total_L', 'Montant_total_CFA']]
     return stats
 
-
 def detecter_anomalies(
     df_transactions: pd.DataFrame,
     df_vehicules: pd.DataFrame
@@ -525,15 +524,33 @@ def detecter_anomalies(
     heure_fin_non_ouvre = st.session_state.get('ss_heure_fin_non_ouvre', DEFAULT_HEURE_FIN_NON_OUVRE)
     delta_minutes_double = st.session_state.get('ss_delta_minutes_facturation_double', DEFAULT_DELTA_MINUTES_FACTURATION_DOUBLE)
 
-    for index, row in df_merged.iterrows():
-        cat = row['Catégorie']
-        seuil = seuils_conso.get(cat, DEFAULT_CONSO_SEUIL)
-        if pd.notna(row['consommation_100km']) and row['consommation_100km'] > seuil:
-            anomalie = row.to_dict()
-            anomalie['type_anomalie'] = 'Consommation excessive'
-            anomalie['detail_anomalie'] = f"{row['consommation_100km']:.1f} L/100km > seuil {seuil} L/100km"
-            anomalie['poids_anomalie'] = st.session_state.get('ss_poids_conso_excessive', DEFAULT_POIDS_CONSO_EXCESSIVE)
-            all_anomalies.append(anomalie)
+    
+    # NOUVELLE MÉTHODE - détection avec méthode ajustée par véhicule
+    df_merged_sorted = df_merged.sort_values(['Card num.', 'DateTime'])
+    for carte in df_merged_sorted['Card num.'].unique():
+        sub = df_merged_sorted[df_merged_sorted['Card num.'] == carte]
+        if len(sub) > 1:  # Au moins 2 transactions pour calculer la consommation
+            # Utiliser la fonction calculer_distance_et_consommation
+            distance_simple, distance_cumulative, consommation_recommandee, methode_utilisee = calculer_distance_et_consommation(sub)
+            
+            if methode_utilisee != "insuffisant" and consommation_recommandee > 0:
+                # Récupérer la catégorie pour déterminer le seuil
+                cat = sub['Catégorie'].iloc[0]
+                seuil = seuils_conso.get(cat, DEFAULT_CONSO_SEUIL)
+                
+                # Vérifier si la consommation dépasse le seuil
+                if consommation_recommandee > seuil:
+                    # Créer une anomalie basée sur la dernière transaction (pour avoir date récente)
+                    derniere_transaction = sub.iloc[-1].to_dict()
+                    derniere_transaction['type_anomalie'] = 'Consommation excessive (globale)'
+                    derniere_transaction['detail_anomalie'] = (
+                        f"{consommation_recommandee:.1f} L/100km > seuil {seuil} L/100km "
+                        f"[Méthode {methode_utilisee}]"
+                    )
+                    derniere_transaction['poids_anomalie'] = st.session_state.get(
+                        'ss_poids_conso_excessive', DEFAULT_POIDS_CONSO_EXCESSIVE
+                    )
+                    all_anomalies.append(derniere_transaction)
 
     depassement = df_merged[df_merged['Quantity'] > df_merged['Cap-rèservoir']].copy()
     if not depassement.empty:
@@ -542,7 +559,7 @@ def detecter_anomalies(
          depassement['poids_anomalie'] = st.session_state.get('ss_poids_depassement_capacite', DEFAULT_POIDS_DEPASSEMENT_CAPACITE)
          all_anomalies.extend(depassement.to_dict('records'))
 
-    df_merged_sorted = df_merged.sort_values(['Card num.', 'DateTime'])
+    # Pour le reste des anomalies, on utilise df_merged_sorted déjà trié
     rapprochees_indices = set()
     for carte in df_merged_sorted['Card num.'].unique():
         sub = df_merged_sorted[df_merged_sorted['Card num.'] == carte]
@@ -667,10 +684,7 @@ def detecter_anomalies(
     cols_final = [col for col in cols_to_keep if col in df_final_anomalies.columns]
     df_final_anomalies = df_final_anomalies[cols_final]
     return df_final_anomalies.sort_values(by=['Nouveau Immat', 'DateTime', 'type_anomalie'])
-
-
-# --- Fonctions d'analyse spécifiques ---
-
+    
 def analyser_stations_risque(df_anomalies: pd.DataFrame, df_transactions: pd.DataFrame) -> pd.DataFrame:
     """
     Analyse les stations en fonction des anomalies détectées pour identifier celles présentant 
@@ -865,7 +879,6 @@ def generer_rapport_vehicule(donnees_vehicule: pd.DataFrame, info_vehicule: pd.S
     })
     return infos_base, stats_conso, analyse['conso_mensuelle'], analyse['stations_frequentes'], analyse
 
-
 def calculer_distance_et_consommation(df_transactions: pd.DataFrame) -> Tuple[float, float, float, str]:
     """Calcule la distance parcourue et la consommation en utilisant différentes méthodes.
 
@@ -877,7 +890,7 @@ def calculer_distance_et_consommation(df_transactions: pd.DataFrame) -> Tuple[fl
         - distance_simple: Distance calculée par différence première/dernière transaction
         - distance_cumulative: Distance calculée en sommant les distances entre transactions
         - consommation_recommandee: Consommation calculée avec la méthode la plus fiable
-        - methode_utilisee: Méthode utilisée pour le calcul ('simple', 'cumulative', 'hybride', 'insuffisant')
+        - methode_utilisee: Méthode utilisée pour le calcul ('simple', 'cumulative', 'hybride', 'ajustee', 'insuffisant')
     """
     if df_transactions.empty or len(df_transactions) < 2:
         return 0.0, 0.0, 0.0, "insuffisant"
@@ -926,6 +939,7 @@ def calculer_distance_et_consommation(df_transactions: pd.DataFrame) -> Tuple[fl
     if distance_simple == 0 and distance_cumulative == 0:
         return 0.0, 0.0, 0.0, "insuffisant"
 
+    # Déterminer la distance à utiliser (avant le calcul des consommations)
     # Si les deux méthodes donnent des résultats similaires (écart < 10%)
     if distance_simple > 0 and distance_cumulative > 0:
         max_dist = max(distance_simple, distance_cumulative)
@@ -942,11 +956,45 @@ def calculer_distance_et_consommation(df_transactions: pd.DataFrame) -> Tuple[fl
         distance_utilisee = distance_cumulative if distance_cumulative > 0 else distance_simple
         methode = "cumulative" if distance_cumulative > 0 else "simple"
 
-    # Calculer la consommation
-    volume_total = df_transactions['Quantity'].sum()
-    consommation = (volume_total / distance_utilisee * 100) if distance_utilisee > 0 else 0.0
+    # Calculer la consommation standard (avec tout le volume)
+    volume_total = df_sorted['Quantity'].sum()
+    consommation_standard = (volume_total / distance_utilisee * 100) if distance_utilisee > 0 else 0.0
+    
+    # Calculer aussi la consommation ajustée en excluant le dernier plein
+    consommation_ajustee = 0.0
+    if len(df_sorted) > 1 and distance_utilisee > 0:
+        volume_sans_dernier_plein = df_sorted.iloc[:-1]['Quantity'].sum()
+        dernier_plein = df_sorted.iloc[-1]['Quantity']
+        consommation_ajustee = (volume_sans_dernier_plein / distance_utilisee * 100)
+        
+        # Stocker dans session_state pour accès ultérieur
+        st.session_state['derniere_consommation_ajustee'] = consommation_ajustee
+        st.session_state['volume_sans_dernier_plein'] = volume_sans_dernier_plein
+        st.session_state['dernier_plein_volume'] = dernier_plein
+        
+        # Mémoriser aussi le véhicule concerné pour éviter les confusions
+        if 'Card num.' in df_sorted.columns:
+            st.session_state['vehicule_consommation_ajustee'] = df_sorted['Card num.'].iloc[0]
+        else:
+            st.session_state['vehicule_consommation_ajustee'] = None
+            
+        # MODIFICATION: Déterminer si la méthode ajustée devrait être recommandée
+        # Vérifier si le dernier plein représente une portion significative du volume total
+        if dernier_plein > 0 and volume_total > 0:
+            pourcentage_dernier_plein = (dernier_plein / volume_total) * 100
+            # Si le dernier plein représente plus de 15% du volume total, privilégier la méthode ajustée
+            if pourcentage_dernier_plein > 15:
+                methode = "ajustee"
+    else:
+        st.session_state['derniere_consommation_ajustee'] = 0.0
+        st.session_state['volume_sans_dernier_plein'] = 0.0
+        st.session_state['dernier_plein_volume'] = 0.0
+        st.session_state['vehicule_consommation_ajustee'] = None
 
-    return distance_simple, distance_cumulative, consommation, methode
+    # MODIFICATION: Choisir la consommation recommandée en fonction de la méthode
+    consommation_recommandee = consommation_ajustee if methode == "ajustee" else consommation_standard
+
+    return distance_simple, distance_cumulative, consommation_recommandee, methode
 
 def calculer_kpis_globaux(df_transactions: pd.DataFrame, df_vehicules: pd.DataFrame, date_debut: datetime.date, date_fin: datetime.date, selected_categories: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Calcule les KPIs de consommation et de coût par catégorie et véhicule."""
@@ -1249,15 +1297,160 @@ def afficher_page_analyse_periodes(df_transactions: pd.DataFrame, df_vehicules: 
     """Affiche la page d'analyse de consommation par période."""
     st.header(f"📅 Analyse de Consommation par Période ({date_debut.strftime('%d/%m/%Y')} - {date_fin.strftime('%d/%m/%Y')})")
 
-    # Fonction interne pour l'analyse de période personnalisée
-    def analyser_consommation_par_periode_custom(df_trans, df_vehs, date_deb, date_fin, selected_categories=None, selected_vehicles=None):
-        """Analyse la consommation pour une période personnalisée."""
-        # Utiliser la même logique que analyser_consommation_par_periode mais avec période journalière
-        return analyser_consommation_par_periode(
-            df_trans, df_vehs, date_deb, date_fin,
-            periode='D', selected_categories=selected_categories,
-            selected_vehicles=selected_vehicles
+    # Fonction interne améliorée pour l'analyse de période personnalisée avec méthode ajustée
+    def analyser_consommation_par_periode_amelioree(df_trans, df_vehs, date_deb, date_fin, periode='D', selected_categories=None, selected_vehicles=None):
+        """Analyse la consommation pour une période avec méthode ajustée."""
+        if df_trans.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        cols_veh_periode = ['N° Carte', 'Catégorie', 'Nouveau Immat', 'Cap-rèservoir']
+        if 'Dotation' in df_vehs.columns:
+            cols_veh_periode.append('Dotation')
+
+        df = df_trans.merge(
+            df_vehs[cols_veh_periode],
+            left_on='Card num.',
+            right_on='N° Carte',
+            how='left'
         )
+
+        mask_date = (df['Date'].dt.date >= date_deb) & (df['Date'].dt.date <= date_fin)
+        df = df[mask_date].copy()
+
+        if selected_categories:
+            df = df[df['Catégorie'].isin(selected_categories)]
+        if selected_vehicles:
+            df = df[df['Nouveau Immat'].isin(selected_vehicles)]
+
+        if df.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        # Ajout de la période comme champ
+        if periode == 'D':
+            df['periode_str'] = df['Date'].dt.strftime('%Y-%m-%d')
+        elif periode == 'W':
+            df['periode_str'] = df['Date'].dt.to_period('W').astype(str)
+        elif periode == 'M':
+            df['periode_str'] = df['Date'].dt.strftime('%Y-%m')
+        elif periode == 'Q':
+            df['periode_str'] = df['Date'].dt.to_period('Q').astype(str)
+        else:
+            df['periode_str'] = df['Date'].dt.strftime('%Y')
+
+        # AMÉLIORATION: Utilisation de la méthode ajustée pour chaque véhicule par période
+        vehicle_period_data = []
+        methodes_utilisees = {'simple': 0, 'cumulative': 0, 'hybride': 0, 'ajustee': 0, 'insuffisant': 0}
+
+        # Grouper par véhicule et période
+        for (veh, periode_val), group in df.groupby(['Nouveau Immat', 'periode_str']):
+            if len(group) < 2:
+                continue  # Il faut au moins 2 transactions pour calculer la consommation
+
+            # Trier par date
+            group_sorted = group.sort_values('DateTime')
+            
+            # Extraire les informations du véhicule
+            categorie = group_sorted['Catégorie'].iloc[0]
+            volume_total = group_sorted['Quantity'].sum()
+            cout_total = group_sorted['Amount'].sum()
+            nb_transactions = len(group_sorted)
+
+            # Calculer la distance et la consommation avec notre méthode améliorée
+            distance_simple, distance_cumulative, consommation_recommandee, methode_utilisee = calculer_distance_et_consommation(group_sorted)
+            
+            # Compter l'utilisation des méthodes
+            methodes_utilisees[methode_utilisee] += 1
+            
+            # Calculer le volume ajusté si nécessaire
+            volume_ajuste = volume_total
+            if methode_utilisee == "ajustee" and len(group_sorted) > 1:
+                volume_ajuste = group_sorted.iloc[:-1]['Quantity'].sum()
+            
+            # Déterminer la distance utilisée
+            if methode_utilisee != "insuffisant":
+                # Utiliser la distance de la méthode recommandée
+                if methode_utilisee == "hybride":
+                    distance_utilisee = (distance_simple + distance_cumulative) / 2
+                else:
+                    distance_utilisee = distance_cumulative if methode_utilisee == "cumulative" else distance_simple
+                
+                # Récupérer le seuil de consommation pour la catégorie
+                seuils_conso = st.session_state.get('ss_conso_seuils_par_categorie', {})
+                seuil_conso = seuils_conso.get(categorie, DEFAULT_CONSO_SEUIL)
+                
+                # Ajouter aux données
+                vehicle_period_data.append({
+                    'Nouveau Immat': veh,
+                    'Catégorie': categorie,
+                    'periode_str': periode_val,
+                    'volume_total': volume_total,
+                    'volume_ajuste': volume_ajuste,
+                    'cout_total': cout_total,
+                    'distance_totale': distance_utilisee,
+                    'nb_transactions': nb_transactions,
+                    'consommation_moyenne': consommation_recommandee,
+                    'methode_utilisee': methode_utilisee,
+                    'seuil_consommation': seuil_conso
+                })
+
+        # Créer le DataFrame des données par véhicule et période
+        if not vehicle_period_data:
+            return pd.DataFrame(), pd.DataFrame()
+            
+        conso_veh_periode = pd.DataFrame(vehicle_period_data)
+        
+        # Calculer les écarts par rapport aux seuils
+        conso_veh_periode['exces_consommation'] = np.where(
+            conso_veh_periode['consommation_moyenne'] > conso_veh_periode['seuil_consommation'],
+            conso_veh_periode['consommation_moyenne'] - conso_veh_periode['seuil_consommation'],
+            0
+        )
+        
+        conso_veh_periode['pourcentage_exces'] = np.where(
+            conso_veh_periode['seuil_consommation'] > 0,
+            (conso_veh_periode['exces_consommation'] / conso_veh_periode['seuil_consommation']) * 100,
+            0
+        )
+        
+        # Agrégation par période tous véhicules confondus
+        conso_periode = pd.DataFrame()
+        if not conso_veh_periode.empty:
+            # Grouper par période pour le récapitulatif global
+            conso_periode = conso_veh_periode.groupby('periode_str').agg(
+                volume_total=('volume_total', 'sum'),
+                volume_ajuste=('volume_ajuste', 'sum'),  # Nouveau champ avec volume ajusté
+                cout_total=('cout_total', 'sum'),
+                distance_totale=('distance_totale', 'sum'),
+                nb_transactions=('nb_transactions', 'sum'),
+                nb_vehicules=('Nouveau Immat', 'nunique')
+            ).reset_index()
+            
+            # Calculer la consommation moyenne et ajustée globale par période
+            conso_periode['consommation_moyenne'] = np.where(
+                conso_periode['distance_totale'] > 0,
+                (conso_periode['volume_total'] / conso_periode['distance_totale']) * 100,
+                np.nan
+            )
+            
+            # Nouvelle méthode: consommation ajustée globale
+            conso_periode['consommation_ajustee'] = np.where(
+                conso_periode['distance_totale'] > 0,
+                (conso_periode['volume_ajuste'] / conso_periode['distance_totale']) * 100,
+                np.nan
+            )
+        
+        # Arrondir les valeurs numériques
+        for df_to_round in [conso_veh_periode, conso_periode]:
+            if not df_to_round.empty:
+                cols_to_round = [col for col in df_to_round.columns if col not in ['Nouveau Immat', 'Catégorie', 'periode_str', 'methode_utilisee']]
+                for col in cols_to_round:
+                    if pd.api.types.is_numeric_dtype(df_to_round[col]):
+                        df_to_round[col] = df_to_round[col].round(1)
+        
+        # Information sur les méthodes utilisées
+        st.session_state['derniere_methodes_utilisees'] = methodes_utilisees
+        
+        return conso_periode, conso_veh_periode
 
     if df_transactions.empty:
         st.warning("Aucune transaction à analyser pour la période sélectionnée.")
@@ -1311,7 +1504,9 @@ def afficher_page_analyse_periodes(df_transactions: pd.DataFrame, df_vehicules: 
         all_cats = sorted(df_vehicules['Catégorie'].dropna().astype(str).unique())
         selected_cats = st.multiselect(
             "Filtrer par Catégories de véhicules",
-            options=all_cats,default=all_cats,key="periode_cat_filter"
+            options=all_cats,
+            default=all_cats,
+            key="periode_cat_filter"
         )
     with st.expander("Filtrer par véhicules spécifiques (optionnel)"):
         if selected_cats:
@@ -1320,22 +1515,36 @@ def afficher_page_analyse_periodes(df_transactions: pd.DataFrame, df_vehicules: 
             available_vehicles = sorted(df_vehicules['Nouveau Immat'].dropna().unique())
         selected_vehicles = st.multiselect(
             "Sélectionner des véhicules spécifiques",
-            options=available_vehicles,default=None,key="periode_veh_filter"
+            options=available_vehicles,
+            default=None,
+            key="periode_veh_filter"
+        )
+
+    # AMÉLIORATION: Option pour utiliser la méthode ajustée
+    with st.expander("Options de calcul avancées", expanded=False):
+        st.info("ℹ️ Par défaut, le système utilise la méthode la plus pertinente pour chaque véhicule (simple, cumulative, hybride ou ajustée sans dernier plein).")
+        
+        prefer_adjusted = st.checkbox(
+            "Privilégier la méthode ajustée (sans dernier plein)",
+            value=True,
+            help="Recommandé pour des résultats plus précis. La méthode ajustée exclut le dernier plein qui n'a pas encore été consommé."
         )
 
     with st.spinner(f"Analyse {periode_label.lower()} en cours..."):
         if periode_code == 'CUSTOM':
             # Pour période personnalisée
-            conso_periode, conso_veh_periode = analyser_consommation_par_periode_custom(
+            conso_periode, conso_veh_periode = analyser_consommation_par_periode_amelioree(
                 df_transactions, df_vehicules, date_debut, date_fin,
+                periode='D',  # On utilise le jour pour les périodes personnalisées
                 selected_categories=selected_cats,
                 selected_vehicles=selected_vehicles if selected_vehicles else None
             )
         else:
             # Pour les périodes standards
-            conso_periode, conso_veh_periode = analyser_consommation_par_periode(
+            conso_periode, conso_veh_periode = analyser_consommation_par_periode_amelioree(
                 df_transactions, df_vehicules, date_debut, date_fin,
-                periode=periode_code, selected_categories=selected_cats,
+                periode=periode_code,
+                selected_categories=selected_cats,
                 selected_vehicles=selected_vehicles if selected_vehicles else None
             )
 
@@ -1343,96 +1552,343 @@ def afficher_page_analyse_periodes(df_transactions: pd.DataFrame, df_vehicules: 
         st.warning(f"Données insuffisantes pour l'analyse {periode_label.lower()}.")
         return
 
-    st.subheader(f"Consommation {periode_label} Globale")
-    afficher_dataframe_avec_export(
-        conso_periode[['periode_str', 'volume_total', 'cout_total', 'distance_totale',
-                      'consommation_moyenne', 'nb_transactions', 'nb_vehicules']],
-        f"Récapitulatif {periode_label}",key=f"recap_periode_{periode_code}"
-    )
-    fig_conso = px.line(
-        conso_periode, x='periode_str', y='consommation_moyenne',
-        title=f"Évolution de la Consommation Moyenne ({periode_label})",
-        labels={'periode_str': periode_label, 'consommation_moyenne': 'Conso. Moyenne (L/100km)'},
-        markers=True
-    )
-    conso_moy_globale = conso_periode['consommation_moyenne'].mean()
-    fig_conso.add_hline(
-        y=conso_moy_globale,line_dash="dash", line_color="green",
-        annotation_text=f"Moyenne: {conso_moy_globale:.1f} L/100km"
-    )
-    st.plotly_chart(fig_conso, use_container_width=True)
+    # AMÉLIORATION: Afficher les méthodes utilisées
+    methodes_utilisees = st.session_state.get('derniere_methodes_utilisees', {})
+    if sum(methodes_utilisees.values()) > 0:
+        st.success(f"✅ Analyse réalisée avec plusieurs méthodes: {methodes_utilisees['simple']} simple, {methodes_utilisees['cumulative']} cumulative, {methodes_utilisees['hybride']} hybride, {methodes_utilisees['ajustee']} ajustée")
 
+    st.subheader(f"Consommation {periode_label} Globale")
+    # AMÉLIORATION: Inclure la consommation ajustée dans l'affichage
+    if 'consommation_ajustee' in conso_periode.columns:
+        conso_periode_display = conso_periode.copy()
+        conso_periode_display.rename(columns={
+            'consommation_moyenne': 'Consommation Standard (L/100km)',
+            'consommation_ajustee': 'Consommation Ajustée (L/100km)'
+        }, inplace=True)
+        
+        afficher_dataframe_avec_export(
+            conso_periode_display,
+            f"Récapitulatif {periode_label}",
+            key=f"recap_periode_{periode_code}"
+        )
+        
+        # Graphique comparatif des deux méthodes
+        fig_conso = px.line(
+            conso_periode.sort_values('periode_str'), 
+            x='periode_str', 
+            y=['consommation_moyenne', 'consommation_ajustee'],
+            title=f"Évolution de la Consommation par {periode_label}",
+            labels={
+                'periode_str': periode_label, 
+                'value': 'Consommation (L/100km)', 
+                'variable': 'Méthode'
+            },
+            markers=True,
+            color_discrete_map={
+                'consommation_moyenne': 'blue',
+                'consommation_ajustee': 'green'
+            }
+        )
+        
+        # Calcul des moyennes pour les lignes de référence
+        conso_std_moy = conso_periode['consommation_moyenne'].mean()
+        conso_adj_moy = conso_periode['consommation_ajustee'].mean()
+        
+        # Ajouter des lignes pour les moyennes
+        fig_conso.add_hline(
+            y=conso_std_moy,
+            line_dash="dash", 
+            line_color="blue",
+            annotation_text=f"Moy. standard: {conso_std_moy:.1f} L/100km"
+        )
+        
+        fig_conso.add_hline(
+            y=conso_adj_moy,
+            line_dash="dash", 
+            line_color="green",
+            annotation_text=f"Moy. ajustée: {conso_adj_moy:.1f} L/100km"
+        )
+        
+        # Ajouter une légende pour les méthodes
+        fig_conso.update_layout(
+            legend=dict(
+                title="Méthode de calcul",
+                orientation="h",
+                y=1.1,
+                xanchor="center",
+                x=0.5
+            )
+        )
+        
+        st.plotly_chart(fig_conso, use_container_width=True)
+        
+        # Explication sur les méthodes
+        with st.expander("ℹ️ Comprendre la différence entre consommation standard et ajustée", expanded=False):
+            st.markdown("""
+            ### Deux méthodes de calcul de la consommation
+            
+            - **Consommation Standard** : Utilise tout le volume de carburant divisé par la distance parcourue
+            - **Consommation Ajustée** : Exclut le dernier plein de chaque véhicule car ce carburant n'a pas encore été consommé
+            
+            La méthode ajustée est généralement plus précise car elle évite de compter du carburant qui est encore dans le réservoir.
+            La différence entre les deux méthodes est d'autant plus importante que les derniers pleins représentent une part significative du volume total.
+            """)
+    else:
+        # Affichage original si pas de données ajustées
+        afficher_dataframe_avec_export(
+            conso_periode[['periode_str', 'volume_total', 'cout_total', 'distance_totale',
+                          'consommation_moyenne', 'nb_transactions', 'nb_vehicules']],
+            f"Récapitulatif {periode_label}",
+            key=f"recap_periode_{periode_code}"
+        )
+        
+        fig_conso = px.line(
+            conso_periode.sort_values('periode_str'), 
+            x='periode_str', 
+            y='consommation_moyenne',
+            title=f"Évolution de la Consommation Moyenne ({periode_label})",
+            labels={'periode_str': periode_label, 'consommation_moyenne': 'Conso. Moyenne (L/100km)'},
+            markers=True
+        )
+        
+        conso_moy_globale = conso_periode['consommation_moyenne'].mean()
+        fig_conso.add_hline(
+            y=conso_moy_globale,
+            line_dash="dash", 
+            line_color="green",
+            annotation_text=f"Moyenne: {conso_moy_globale:.1f} L/100km"
+        )
+        
+        st.plotly_chart(fig_conso, use_container_width=True)
+
+    # Graphique de volume et coût
     fig_vol_cout = px.bar(
-        conso_periode, x='periode_str', y=['volume_total', 'cout_total'],
+        conso_periode.sort_values('periode_str'), 
+        x='periode_str', 
+        y=['volume_total', 'cout_total'],
         title=f"Volume et Coût par {periode_label}",
         labels={'periode_str': periode_label, 'value': 'Valeur', 'variable': 'Métrique'},
         barmode='group'
     )
     st.plotly_chart(fig_vol_cout, use_container_width=True)
 
+    # AMÉLIORATION: Ajouter visualisation des méthodes utilisées
+    if 'methode_utilisee' in conso_veh_periode.columns:
+        st.subheader("📊 Méthodes de Calcul Utilisées")
+        
+        # Compter les méthodes
+        methodes_count = conso_veh_periode['methode_utilisee'].value_counts().reset_index()
+        methodes_count.columns = ['Méthode', 'Nombre']
+        
+        # Création de colonnes pour la visualisation
+        col_meth1, col_meth2 = st.columns([1, 2])
+        
+        with col_meth1:
+            st.dataframe(methodes_count)
+        
+        with col_meth2:
+            if not methodes_count.empty:
+                fig_methodes = px.pie(
+                    methodes_count,
+                    values='Nombre',
+                    names='Méthode',
+                    title="Répartition des Méthodes de Calcul",
+                    color_discrete_map={
+                        'simple': '#fff5e6',
+                        'cumulative': '#fff2e6',
+                        'hybride': '#e6f3ff',
+                        'ajustee': '#e6ffec',
+                        'insuffisant': '#f8f8f8'
+                    }
+                )
+                st.plotly_chart(fig_methodes, use_container_width=True)
+
     st.subheader(f"Détail par Véhicule et par {periode_label}")
+    
+    # AMÉLIORATION: Filtrage par méthode
+    if 'methode_utilisee' in conso_veh_periode.columns:
+        methodes_disponibles = conso_veh_periode['methode_utilisee'].unique()
+        methodes_filter = st.multiselect(
+            "Filtrer par méthode de calcul",
+            options=sorted(methodes_disponibles),
+            default=list(methodes_disponibles),
+            key="methodes_filter"
+        )
+        
+        if methodes_filter:
+            conso_veh_periode = conso_veh_periode[conso_veh_periode['methode_utilisee'].isin(methodes_filter)]
+    
+    # Analyse des excès de consommation
     exces_veh = conso_veh_periode[conso_veh_periode['exces_consommation'] > 0]
     nb_exces = len(exces_veh)
+    
     if nb_exces > 0:
         st.warning(f"⚠️ Détecté : {nb_exces} cas d'excès de consommation sur la période.")
+        
+        # AMÉLIORATION: Inclure la méthode de calcul dans l'affichage
         cols_display_exces = [
             'periode_str', 'Nouveau Immat', 'Catégorie', 'consommation_moyenne',
             'seuil_consommation', 'exces_consommation', 'pourcentage_exces',
             'volume_total', 'distance_totale', 'nb_transactions'
         ]
-        afficher_dataframe_avec_export(
-            exces_veh[cols_display_exces],"Excès de Consommation Détectés",key=f"exces_conso_{periode_code}"
-        )
+        
+        if 'methode_utilisee' in exces_veh.columns:
+            cols_display_exces.insert(3, 'methode_utilisee')
+        
+        # Fonction pour mettre en surbrillance les méthodes
+        def highlight_method(val):
+            if val == 'ajustee':
+                return 'background-color: #e6ffec'  # Vert clair
+            elif val == 'hybride':
+                return 'background-color: #e6f3ff'  # Bleu clair
+            elif val == 'cumulative':
+                return 'background-color: #fff2e6'  # Orange clair
+            elif val == 'simple':
+                return 'background-color: #fff5e6'  # Jaune clair
+            return ''
+        
+        # Afficher avec mise en évidence des méthodes si disponible
+        if 'methode_utilisee' in exces_veh.columns:
+            st.dataframe(
+                exces_veh[cols_display_exces].style.applymap(
+                    highlight_method, subset=['methode_utilisee']
+                ),
+                use_container_width=True
+            )
+        else:
+            afficher_dataframe_avec_export(
+                exces_veh[cols_display_exces],
+                "Excès de Consommation Détectés",
+                key=f"exces_conso_{periode_code}"
+            )
+        
+        # Graphique des excès par véhicule
         top_exces = exces_veh.nlargest(10, 'pourcentage_exces')
-        fig_top_exces = px.bar(
-            top_exces,x='Nouveau Immat',y='pourcentage_exces',color='Catégorie',
-            title="Top 10 des Excès de Consommation (%)",
-            labels={'pourcentage_exces': "Excès (%)", 'Nouveau Immat': 'Véhicule'},
-            hover_data=['periode_str', 'consommation_moyenne', 'seuil_consommation']
-        )
+        
+        # AMÉLIORATION: Inclure la méthode dans le graphique
+        if 'methode_utilisee' in top_exces.columns:
+            fig_top_exces = px.bar(
+                top_exces,
+                x='Nouveau Immat',
+                y='pourcentage_exces',
+                color='methode_utilisee',
+                title="Top 10 des Excès de Consommation (%)",
+                labels={
+                    'pourcentage_exces': "Excès (%)", 
+                    'Nouveau Immat': 'Véhicule',
+                    'methode_utilisee': 'Méthode'
+                },
+                hover_data=['periode_str', 'consommation_moyenne', 'seuil_consommation'],
+                color_discrete_map={
+                    'simple': '#fff5e6',
+                    'cumulative': '#fff2e6',
+                    'hybride': '#e6f3ff',
+                    'ajustee': '#e6ffec',
+                    'insuffisant': '#f8f8f8'
+                }
+            )
+        else:
+            fig_top_exces = px.bar(
+                top_exces,
+                x='Nouveau Immat',
+                y='pourcentage_exces',
+                color='Catégorie',
+                title="Top 10 des Excès de Consommation (%)",
+                labels={'pourcentage_exces': "Excès (%)", 'Nouveau Immat': 'Véhicule'},
+                hover_data=['periode_str', 'consommation_moyenne', 'seuil_consommation']
+            )
+            
         st.plotly_chart(fig_top_exces, use_container_width=True)
     else:
         st.success("✅ Aucun excès de consommation détecté sur la période analysée.")
 
     with st.expander("Voir toutes les données détaillées par véhicule et période"):
+        # AMÉLIORATION: Inclure les méthodes dans les colonnes à afficher
         cols_display_detail = [
             'periode_str', 'Nouveau Immat', 'Catégorie', 'volume_total',
             'distance_totale', 'consommation_moyenne', 'seuil_consommation',
             'exces_consommation', 'pourcentage_exces', 'cout_total', 'nb_transactions'
         ]
-        afficher_dataframe_avec_export(
-            conso_veh_periode[cols_display_detail],
-            f"Toutes les données par Véhicule et {periode_label}",key=f"all_data_periode_{periode_code}"
+        
+        if 'methode_utilisee' in conso_veh_periode.columns:
+            cols_display_detail.insert(3, 'methode_utilisee')
+            
+            st.dataframe(
+                conso_veh_periode[cols_display_detail].style.applymap(
+                    highlight_method, subset=['methode_utilisee']
+                ),
+                use_container_width=True
+            )
+        else:
+            afficher_dataframe_avec_export(
+                conso_veh_periode[cols_display_detail],
+                f"Toutes les données par Véhicule et {periode_label}",
+                key=f"all_data_periode_{periode_code}"
+            )
+        
+        # Option d'export
+        excel_data = to_excel(conso_veh_periode[cols_display_detail])
+        st.download_button(
+            label=f"📥 Exporter les données détaillées ({periode_label})",
+            data=excel_data,
+            file_name=f"analyse_periode_{periode_code}_{date_debut.strftime('%Y%m%d')}_{date_fin.strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
     with st.expander("Analyse comparative entre périodes", expanded=False):
         st.info("Cette section permet de visualiser l'évolution de la consommation par véhicule à travers les périodes.")
         vehicules_list = sorted(conso_veh_periode['Nouveau Immat'].unique())
         if vehicules_list:
             vehicule_selected = st.selectbox(
                 "Sélectionner un véhicule pour l'analyse détaillée :",
-                options=vehicules_list,key="compare_vehicule_select"
+                options=vehicules_list,
+                key="compare_vehicule_select"
             )
+
             veh_data = conso_veh_periode[conso_veh_periode['Nouveau Immat'] == vehicule_selected]
             if not veh_data.empty:
+                # AMÉLIORATION: Inclure la méthode utilisée dans le titre
+                methodes_veh = veh_data['methode_utilisee'].unique() if 'methode_utilisee' in veh_data.columns else []
+                methodes_info = f" (Méthodes: {', '.join(methodes_veh)})" if methodes_veh else ""
+                
                 fig_veh_evo = px.line(
-                    veh_data, x='periode_str', y=['consommation_moyenne', 'seuil_consommation'],
-                    title=f"Évolution de la Consommation - {vehicule_selected}",
-                    labels={'periode_str': periode_label, 'value': 'Consommation (L/100km)', 'variable': 'Métrique'},
-                    markers=True
+                    veh_data.sort_values('periode_str'),
+                    x='periode_str',
+                    y=['consommation_moyenne', 'seuil_consommation'],
+                    title=f"Évolution de la Consommation - {vehicule_selected}{methodes_info}",
+                    labels={
+                        'periode_str': periode_label, 
+                        'value': 'Consommation (L/100km)', 
+                        'variable': 'Métrique'
+                    },
+                    markers=True,
+                    color_discrete_map={
+                        'consommation_moyenne': 'blue',
+                        'seuil_consommation': 'red'
+                    }
                 )
                 st.plotly_chart(fig_veh_evo, use_container_width=True)
-                st.dataframe(veh_data[[
-                    'periode_str', 'consommation_moyenne', 'seuil_consommation',
-                    'exces_consommation', 'volume_total', 'distance_totale'
-                ]], use_container_width=True)
+                
+                # Affichage détaillé avec méthode mise en évidence
+                if 'methode_utilisee' in veh_data.columns:
+                    st.dataframe(
+                        veh_data[[
+                            'periode_str', 'methode_utilisee', 'consommation_moyenne', 'seuil_consommation',
+                            'exces_consommation', 'volume_total', 'distance_totale'
+                        ]].style.applymap(
+                            highlight_method, subset=['methode_utilisee']
+                        ),
+                        use_container_width=True
+                    )
+                else:
+                    st.dataframe(veh_data[[
+                        'periode_str', 'consommation_moyenne', 'seuil_consommation',
+                        'exces_consommation', 'volume_total', 'distance_totale'
+                    ]], use_container_width=True)
             else:
                 st.info(f"Pas de données disponibles pour {vehicule_selected} sur les périodes sélectionnées.")
         else:
             st.info("Aucun véhicule avec données suffisantes pour l'analyse comparative.")
-
-# ---------------------------------------------------------------------
-# NOUVELLES FONCTIONS POUR LE SUIVI DES DOTATIONS
-# ---------------------------------------------------------------------
 def analyser_suivi_dotations(
     df_transactions_filtrees: pd.DataFrame,
     df_vehicules: pd.DataFrame, # Doit contenir 'N° Carte', 'Nouveau Immat', 'Catégorie', 'Dotation'
@@ -6948,22 +7404,37 @@ def afficher_page_analyse_vehicules(df_transactions: pd.DataFrame, df_vehicules:
                             distance_geoloc = trajets_veh['Distance'].sum()
                             consommation_geoloc = (total_volume_veh / distance_geoloc) * 100 if distance_geoloc > 0 else 0
                 
+                # Récupérer la consommation ajustée depuis session_state
+                consommation_ajustee = 0.0
+                if (st.session_state.get('vehicule_consommation_ajustee') == vehicle_card and 
+                    'derniere_consommation_ajustee' in st.session_state):
+                    consommation_ajustee = st.session_state['derniere_consommation_ajustee']
+                    volume_sans_dernier = st.session_state.get('volume_sans_dernier_plein', 0.0)
+                    dernier_plein = st.session_state.get('dernier_plein_volume', 0.0)
+                
                 # Créer un tableau comparatif des méthodes
                 comparison_data = {
                     'Méthode': ['Simple (première/dernière transaction)', 'Cumulative (somme des deltas)', 
-                              'Hybride/Recommandée', 'Géolocalisation (si disponible)'],
-                    'Distance (km)': [distance_simple, distance_cumulative, 
-                                   max(distance_simple, distance_cumulative), distance_geoloc],
+                              'Hybride/Recommandée', 'Ajustée (sans dernier plein)', 'Géolocalisation (si disponible)'],
+                    'Distance (km)': [
+                        distance_simple, 
+                        distance_cumulative, 
+                        max(distance_simple, distance_cumulative), 
+                        max(distance_simple, distance_cumulative), 
+                        distance_geoloc
+                    ],
                     'Consommation (L/100km)': [
                         (total_volume_veh / distance_simple) * 100 if distance_simple > 0 else 0,
                         (total_volume_veh / distance_cumulative) * 100 if distance_cumulative > 0 else 0,
                         consommation_recommandee,
+                        consommation_ajustee,
                         consommation_geoloc
                     ],
                     'Description': [
                         'Différence entre le premier et dernier kilométrage',
                         'Somme des distances entre chaque transaction',
                         f'Méthode recommandée ({methode_utilisee})',
+                        f'Exclut le dernier plein de {st.session_state.get("dernier_plein_volume", 0):.1f}L (plus précise)',
                         'Basée sur les données GPS réelles'
                     ]
                 }
@@ -6979,6 +7450,8 @@ def afficher_page_analyse_vehicules(df_transactions: pd.DataFrame, df_vehicules:
                 def highlight_recommended(row):
                     if row['Méthode'] == 'Hybride/Recommandée':
                         return ['background-color: rgba(0, 128, 0, 0.2)'] * len(row)
+                    elif row['Méthode'] == 'Ajustée (sans dernier plein)':
+                        return ['background-color: rgba(0, 0, 255, 0.1)'] * len(row)
                     return [''] * len(row)
                 
                 # Afficher le tableau comparatif stylisé
@@ -6991,6 +7464,7 @@ def afficher_page_analyse_vehicules(df_transactions: pd.DataFrame, df_vehicules:
                 - **Méthode simple**: Utilise uniquement le premier et le dernier kilométrage de la période.
                 - **Méthode cumulative**: Additionne toutes les distances individuelles entre chaque transaction.
                 - **Méthode hybride/recommandée**: Combine intelligemment les deux méthodes précédentes pour une estimation plus fiable.
+                - **Méthode ajustée**: Exclut le dernier plein du calcul car ce carburant n'a pas encore été consommé (généralement plus précise).
                 - **Méthode géolocalisation**: Utilise les données GPS réelles des trajets (la plus précise quand disponible).
                 
                 ⚠️ **Note**: Des écarts importants entre ces méthodes peuvent indiquer des anomalies de déclaration de kilométrage.
@@ -7420,11 +7894,57 @@ def afficher_page_kpi(df_transactions: pd.DataFrame, df_vehicules: pd.DataFrame,
     nb_active_vehicles = merged_df['Nouveau Immat'].nunique()
     avg_price_per_liter = total_amount / total_volume if total_volume > 0 else 0
     
-    # Calcul des KPIs de consommation
-    merged_df['distance_parcourue'] = merged_df['Current mileage'] - merged_df['Past mileage']
-    valid_distance = merged_df.loc[merged_df['distance_parcourue'] > 0, 'distance_parcourue'].sum()
-    avg_consumption_100km = (total_volume / valid_distance) * 100 if valid_distance > 0 else 0
-    avg_cost_per_km = total_amount / valid_distance if valid_distance > 0 else 0
+    # AMÉLIORATION: Calcul des KPIs de consommation avec méthode ajustée
+    st.info("ℹ️ Note: Les calculs de consommation utilisent la méthode la plus pertinente pour chaque véhicule (simple, cumulative, hybride ou ajustée sans dernier plein).")
+    
+    # Grouper par véhicule pour appliquer la fonction calculer_distance_et_consommation
+    vehicle_data = []
+    methodes_utilisees = {'simple': 0, 'cumulative': 0, 'hybride': 0, 'ajustee': 0, 'insuffisant': 0}
+    total_volume_ajuste = 0
+    
+    for card, group in merged_df.groupby('Card num.'):
+        # Trier par date
+        group_sorted = group.sort_values('DateTime')
+        if len(group_sorted) > 1:
+            # Calculer avec les différentes méthodes
+            distance_simple, distance_cumulative, consommation_recommandee, methode_utilisee = calculer_distance_et_consommation(group_sorted)
+            
+            # Compter les méthodes utilisées
+            methodes_utilisees[methode_utilisee] += 1
+            
+            # Extraire les informations du véhicule
+            category = group_sorted['Catégorie'].iloc[0]
+            vehicle = group_sorted['Nouveau Immat'].iloc[0]
+            total_vol = group_sorted['Quantity'].sum()
+            total_cost = group_sorted['Amount'].sum()
+            
+            # Pour le volume ajusté, exclure le dernier plein si méthode=ajustee
+            volume_ajuste = total_vol
+            if methode_utilisee == "ajustee" and len(group_sorted) > 1:
+                volume_ajuste = group_sorted.iloc[:-1]['Quantity'].sum()
+            
+            total_volume_ajuste += volume_ajuste
+            
+            # Ajouter aux données des véhicules
+            if distance_simple > 0 or distance_cumulative > 0:
+                distance_utilisee = max(distance_simple, distance_cumulative)
+                cpk = (total_cost / distance_utilisee) if distance_utilisee > 0 else 0
+                
+                vehicle_data.append({
+                    'Card num.': card,
+                    'Nouveau Immat': vehicle,
+                    'Catégorie': category,
+                    'Volume_Total': total_vol,
+                    'Volume_Ajuste': volume_ajuste,
+                    'Montant_Total': total_cost,
+                    'Distance': distance_utilisee,
+                    'Consommation': consommation_recommandee,
+                    'Cout_km': cpk,
+                    'Methode': methode_utilisee
+                })
+    
+    # Créer DataFrame des données véhicules
+    vehicle_kpis = pd.DataFrame(vehicle_data)
     
     # Affichage des KPIs principaux
     st.subheader("KPIs Globaux")
@@ -7436,81 +7956,229 @@ def afficher_page_kpi(df_transactions: pd.DataFrame, df_vehicules: pd.DataFrame,
     col2.metric("Véhicules Actifs", f"{nb_active_vehicles}")
     
     col3.metric("Prix Moyen / Litre", f"{avg_price_per_liter:.0f} CFA/L")
-    col3.metric("Coût Moyen / Km", f"{avg_cost_per_km:.1f} CFA/km")
     
-    # KPIs par catégorie de véhicule
-    st.subheader("KPIs par Catégorie de Véhicule")
-    category_kpis = merged_df.groupby('Catégorie').agg(
-        Volume_Total=('Quantity', 'sum'),
-        Montant_Total=('Amount', 'sum'),
-        Nb_Transactions=('Quantity', 'count'),
-        Nb_Vehicules=('Nouveau Immat', 'nunique'),
-        Distance_Totale=('distance_parcourue', lambda x: x[x > 0].sum())
-    ).reset_index()
+    # Calculer les KPIs ajustés (si données disponibles)
+    if not vehicle_kpis.empty:
+        total_distance = vehicle_kpis['Distance'].sum()
+        avg_consumption_ajuste = 0
+        avg_cost_per_km = 0
+        
+        if total_distance > 0:
+            # Consommation ajustée globale (en utilisant la somme des volumes ajustés)
+            avg_consumption_ajuste = (total_volume_ajuste / total_distance) * 100
+            avg_cost_per_km = total_amount / total_distance
+        
+        col3.metric("Coût Moyen / Km", f"{avg_cost_per_km:.1f} CFA/km")
+        
+        # Afficher la répartition des méthodes utilisées
+        st.subheader("📊 Méthodes de Calcul Utilisées")
+        methodes_df = pd.DataFrame({
+            'Méthode': list(methodes_utilisees.keys()),
+            'Nombre de Véhicules': list(methodes_utilisees.values())
+        })
+        
+        # Filtrer pour n'inclure que les méthodes utilisées
+        methodes_df = methodes_df[methodes_df['Nombre de Véhicules'] > 0]
+        
+        col_meth1, col_meth2 = st.columns([2, 3])
+        
+        with col_meth1:
+            st.dataframe(methodes_df)
+        
+        with col_meth2:
+            fig_methodes = px.pie(
+                methodes_df, 
+                values='Nombre de Véhicules', 
+                names='Méthode',
+                title="Répartition des Méthodes de Calcul",
+                hole=0.4
+            )
+            st.plotly_chart(fig_methodes, use_container_width=True)
+        
+        # Explication des méthodes
+        with st.expander("💡 Explication des méthodes de calcul", expanded=False):
+            st.markdown("""
+            ### Méthodes de calcul de consommation :
+            - **Simple** : Différence entre premier et dernier relevé kilométrique
+            - **Cumulative** : Somme de toutes les distances entre transactions
+            - **Hybride** : Moyenne des méthodes simple et cumulative quand les résultats sont similaires
+            - **Ajustée** : Exclut le dernier plein du calcul car ce carburant n'a pas encore été consommé
+            
+            Le système choisit automatiquement la méthode la plus pertinente pour chaque véhicule.
+            La méthode ajustée est généralement privilégiée lorsque le dernier plein représente une part importante du volume total.
+            """)
     
-    category_kpis['Consommation_100km'] = category_kpis.apply(
-        lambda row: (row['Volume_Total'] / row['Distance_Totale']) * 100 if row['Distance_Totale'] > 0 else 0, 
-        axis=1
-    )
-    
-    category_kpis['Cout_km'] = category_kpis.apply(
-        lambda row: row['Montant_Total'] / row['Distance_Totale'] if row['Distance_Totale'] > 0 else 0, 
-        axis=1
-    )
-    
-    # Afficher le tableau des KPIs par catégorie
-    afficher_dataframe_avec_export(
-        category_kpis, 
-        "KPIs par Catégorie", 
-        key="category_kpis"
-    )
-    
-    # Graphiques des KPIs
-    col4, col5 = st.columns(2)
-    
-    with col4:
-        fig_consumption = px.bar(
-            category_kpis,
-            x='Catégorie',
-            y='Consommation_100km',
-            title="Consommation par Catégorie (L/100km)",
-            labels={'Consommation_100km': 'L/100km'}
+    # KPIs par catégorie de véhicule (amélioré avec méthode ajustée)
+    if not vehicle_kpis.empty:
+        st.subheader("KPIs par Catégorie de Véhicule")
+        
+        category_kpis = vehicle_kpis.groupby('Catégorie').agg(
+            Volume_Total=('Volume_Total', 'sum'),
+            Volume_Ajuste=('Volume_Ajuste', 'sum'),
+            Montant_Total=('Montant_Total', 'sum'),
+            Nb_Transactions=('Card num.', 'count'),
+            Nb_Vehicules=('Nouveau Immat', 'nunique'),
+            Distance_Totale=('Distance', 'sum'),
+            Consommation_Moyenne=('Consommation', 'mean')  # Moyenne des consommations individuelles (déjà ajustées)
+        ).reset_index()
+        
+        # Calcul de la consommation globale par catégorie (avec volume ajusté)
+        category_kpis['Consommation_Globale'] = category_kpis.apply(
+            lambda row: (row['Volume_Ajuste'] / row['Distance_Totale']) * 100 if row['Distance_Totale'] > 0 else 0, 
+            axis=1
         )
-        st.plotly_chart(fig_consumption, use_container_width=True)
-    
-    with col5:
-        fig_cost = px.bar(
-            category_kpis,
-            x='Catégorie',
-            y='Cout_km',
-            title="Coût par Km par Catégorie",
-            labels={'Cout_km': 'CFA/km'}
+        
+        category_kpis['Cout_km'] = category_kpis.apply(
+            lambda row: row['Montant_Total'] / row['Distance_Totale'] if row['Distance_Totale'] > 0 else 0, 
+            axis=1
         )
-        st.plotly_chart(fig_cost, use_container_width=True)
+        
+        # Arrondir les valeurs
+        for col in ['Consommation_Moyenne', 'Consommation_Globale', 'Cout_km']:
+            category_kpis[col] = category_kpis[col].round(2)
+        
+        # Afficher le tableau des KPIs par catégorie
+        afficher_dataframe_avec_export(
+            category_kpis, 
+            "KPIs par Catégorie", 
+            key="category_kpis_ameliore"
+        )
+        
+        # Graphiques des KPIs
+        col4, col5 = st.columns(2)
+        
+        with col4:
+            fig_consumption = px.bar(
+                category_kpis,
+                x='Catégorie',
+                y=['Consommation_Moyenne', 'Consommation_Globale'],
+                title="Consommation par Catégorie (L/100km)",
+                labels={
+                    'value': 'L/100km', 
+                    'variable': 'Type de consommation'
+                },
+                barmode='group',
+                color_discrete_map={
+                    'Consommation_Moyenne': 'blue',
+                    'Consommation_Globale': 'green'
+                }
+            )
+            st.plotly_chart(fig_consumption, use_container_width=True)
+        
+        with col5:
+            fig_cost = px.bar(
+                category_kpis,
+                x='Catégorie',
+                y='Cout_km',
+                title="Coût par Km par Catégorie",
+                labels={'Cout_km': 'CFA/km'}
+            )
+            st.plotly_chart(fig_cost, use_container_width=True)
+    
+        # NOUVEAU: Détail par véhicule avec méthode utilisée
+        st.subheader("Détails de consommation par véhicule")
+        
+        # Tri et préparation des données par véhicule
+        vehicle_display = vehicle_kpis.copy()
+        vehicle_display['Consommation'] = vehicle_display['Consommation'].round(2)
+        vehicle_display['Cout_km'] = vehicle_display['Cout_km'].round(2)
+        vehicle_display = vehicle_display.sort_values('Consommation')
+        
+        # Fonction pour mettre en surbrillance les méthodes
+        def highlight_method(val):
+            if val == 'ajustee':
+                return 'background-color: #e6ffec'  # Vert clair
+            elif val == 'hybride':
+                return 'background-color: #e6f3ff'  # Bleu clair
+            elif val == 'cumulative':
+                return 'background-color: #fff2e6'  # Orange clair
+            elif val == 'simple':
+                return 'background-color: #fff5e6'  # Jaune clair
+            return ''
+        
+        # Afficher avec mise en évidence des méthodes
+        st.dataframe(
+            vehicle_display.style.applymap(highlight_method, subset=['Methode']),
+            use_container_width=True
+        )
+        
+        # Option pour télécharger les détails
+        excel_data = to_excel(vehicle_display)
+        st.download_button(
+            label="📥 Télécharger les détails de consommation",
+            data=excel_data,
+            file_name=f"details_consommation_{date_debut.strftime('%Y%m%d')}_{date_fin.strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
     
     # KPIs mensuels
     st.subheader("Évolution Mensuelle des KPIs")
     monthly_kpis = merged_df.groupby(pd.Grouper(key='DateTime', freq='M')).agg(
         Volume=('Quantity', 'sum'),
         Montant=('Amount', 'sum'),
-        Nb_Transactions=('Quantity', 'count'),
-        Distance=('distance_parcourue', lambda x: x[x > 0].sum())
+        Nb_Transactions=('Quantity', 'count')
     ).reset_index()
     
     monthly_kpis['Mois'] = monthly_kpis['DateTime'].dt.strftime('%Y-%m')
-    monthly_kpis['Consommation_100km'] = monthly_kpis.apply(
-        lambda row: (row['Volume'] / row['Distance']) * 100 if row['Distance'] > 0 else 0, 
-        axis=1
-    )
+    
+    # Si données véhicules disponibles, ajouter consommation mensuelle
+    if not vehicle_kpis.empty:
+        # Calculer distance mensuelle (agrégation des distances par mois)
+        monthly_distance = merged_df.copy()
+        monthly_distance['Mois'] = monthly_distance['DateTime'].dt.strftime('%Y-%m')
+        
+        # Créer un dictionnaire des consommations par véhicule et par mois
+        # Ceci est complexe et approximatif, car la méthode ajustée s'applique sur toute la période
+        monthly_data = []
+        
+        for mois in monthly_kpis['Mois'].unique():
+            month_vol = monthly_kpis.loc[monthly_kpis['Mois'] == mois, 'Volume'].iloc[0]
+            month_transactions = merged_df[merged_df['DateTime'].dt.strftime('%Y-%m') == mois]
+            
+            # Pour simplifier, utiliser la relation entre transactions mensuelles et total
+            if len(month_transactions) > 0 and nb_transactions > 0:
+                # Estimation proportionnelle de la distance et du volume ajusté
+                month_ratio = len(month_transactions) / nb_transactions
+                est_month_distance = total_distance * month_ratio if 'total_distance' in locals() else 0
+                est_month_vol_ajuste = total_volume_ajuste * month_ratio
+                
+                if est_month_distance > 0:
+                    est_consumption = (est_month_vol_ajuste / est_month_distance) * 100
+                    monthly_data.append({
+                        'Mois': mois,
+                        'Distance': est_month_distance,
+                        'Consommation_100km': est_consumption
+                    })
+        
+        monthly_est_df = pd.DataFrame(monthly_data)
+        
+        if not monthly_est_df.empty:
+            monthly_kpis = monthly_kpis.merge(monthly_est_df, on='Mois', how='left')
+        else:
+            monthly_kpis['Distance'] = 0
+            monthly_kpis['Consommation_100km'] = 0
     
     fig_monthly = px.line(
         monthly_kpis, 
         x='Mois', 
-        y='Consommation_100km',
-        title="Évolution Mensuelle de la Consommation (L/100km)",
-        labels={'Consommation_100km': 'L/100km'}
+        y=['Volume', 'Montant'],
+        title="Évolution Mensuelle du Volume et du Coût",
+        labels={'value': 'Valeur', 'variable': 'Métrique'}
     )
     st.plotly_chart(fig_monthly, use_container_width=True)
+    
+    # Graphique de consommation mensuelle si disponible
+    if 'Consommation_100km' in monthly_kpis.columns:
+        valid_consumption = monthly_kpis.dropna(subset=['Consommation_100km'])
+        if not valid_consumption.empty:
+            fig_monthly_cons = px.line(
+                valid_consumption, 
+                x='Mois', 
+                y='Consommation_100km',
+                title="Évolution Mensuelle de la Consommation (L/100km)",
+                labels={'Consommation_100km': 'L/100km'}
+            )
+            st.plotly_chart(fig_monthly_cons, use_container_width=True)
 
 def afficher_page_autres_cartes(df_transactions: pd.DataFrame, df_autres: pd.DataFrame, date_debut: datetime.date, date_fin: datetime.date):
     """Affiche la page d'analyse des autres types de cartes (non-véhicules)."""
