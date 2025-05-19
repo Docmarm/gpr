@@ -496,25 +496,54 @@ def detecter_anomalies(
     df_vehicules: pd.DataFrame
 ) -> pd.DataFrame:
     """
-    Fonction centrale (simplifiée) pour détecter toutes les anomalies sur les véhicules.
-    Retourne un DataFrame unique avec toutes les anomalies détectées.
+    Fonction centrale pour détecter les anomalies sur les véhicules.
+    Améliorée pour gérer les transactions annulées.
     """
     all_anomalies = []
+    
     # S'assurer que la colonne 'Dotation' existe dans df_vehicules, sinon l'ajouter avec 0
     cols_vehicules_necessaires = ['N° Carte', 'Nouveau Immat', 'Catégorie', 'Type', 'Cap-rèservoir']
     if 'Dotation' in df_vehicules.columns:
         cols_vehicules_necessaires.append('Dotation')
 
     df_merged = df_transactions.merge(
-        df_vehicules[cols_vehicules_necessaires], # Utiliser les colonnes nécessaires
+        df_vehicules[cols_vehicules_necessaires],
         left_on='Card num.',
         right_on='N° Carte',
         how='inner'
     )
-    df_merged['distance_parcourue'] = df_merged['Current mileage'] - df_merged['Past mileage']
-    df_merged['consommation_100km'] = np.where(
-         (df_merged['distance_parcourue'] > 0) & df_merged['Quantity'].notna(),
-         (df_merged['Quantity'] / df_merged['distance_parcourue']) * 100,
+    
+    # Pré-traitement pour identifier les annulations
+    df_merged_sorted = df_merged.sort_values(['Card num.', 'DateTime'])
+    
+    # Marquer les transactions potentiellement annulées
+    df_merged_sorted['est_annulation'] = df_merged_sorted['Quantity'] < 0
+    
+    # Identifier les transactions annulées (association entre transaction et son annulation)
+    df_merged_sorted['transaction_annulee'] = False
+    
+    for carte in df_merged_sorted['Card num.'].unique():
+        sub = df_merged_sorted[df_merged_sorted['Card num.'] == carte]
+        if len(sub) > 1:
+            for i in range(1, len(sub)):
+                row_actuelle = sub.iloc[i]
+                row_precedente = sub.iloc[i-1]
+                
+                # Vérifier si c'est une annulation (quantité négative, timing proche, même station)
+                if (row_actuelle['est_annulation'] and 
+                    row_actuelle['Quantity'] == -row_precedente['Quantity'] and 
+                    (row_actuelle['DateTime'] - row_precedente['DateTime']).total_seconds() < 600 and  # 10 minutes
+                    row_actuelle['Place'] == row_precedente['Place']):
+                    
+                    # Marquer la transaction et son annulation
+                    df_merged_sorted.at[sub.iloc[i-1].name, 'transaction_annulee'] = True
+                    df_merged_sorted.at[sub.iloc[i].name, 'transaction_annulee'] = True
+    
+    # Calcul des distances et consommations
+    df_merged_sorted['distance_parcourue'] = df_merged_sorted['Current mileage'] - df_merged_sorted['Past mileage']
+    df_merged_sorted['consommation_100km'] = np.where(
+         (df_merged_sorted['distance_parcourue'] > 0) & df_merged_sorted['Quantity'].notna(),
+         (df_merged_sorted['Quantity'] / df_merged_sorted['distance_parcourue']) * 100,
          np.nan
     )
 
@@ -524,11 +553,10 @@ def detecter_anomalies(
     heure_fin_non_ouvre = st.session_state.get('ss_heure_fin_non_ouvre', DEFAULT_HEURE_FIN_NON_OUVRE)
     delta_minutes_double = st.session_state.get('ss_delta_minutes_facturation_double', DEFAULT_DELTA_MINUTES_FACTURATION_DOUBLE)
 
-    
-    # NOUVELLE MÉTHODE - détection avec méthode ajustée par véhicule
-    df_merged_sorted = df_merged.sort_values(['Card num.', 'DateTime'])
+    # Détection de consommation excessive - exclure les transactions annulées
     for carte in df_merged_sorted['Card num.'].unique():
-        sub = df_merged_sorted[df_merged_sorted['Card num.'] == carte]
+        # Filtrer pour exclure les transactions annulées
+        sub = df_merged_sorted[(df_merged_sorted['Card num.'] == carte) & (~df_merged_sorted['transaction_annulee'])]
         if len(sub) > 1:  # Au moins 2 transactions pour calculer la consommation
             # Utiliser la fonction calculer_distance_et_consommation
             distance_simple, distance_cumulative, consommation_recommandee, methode_utilisee = calculer_distance_et_consommation(sub)
@@ -552,23 +580,58 @@ def detecter_anomalies(
                     )
                     all_anomalies.append(derniere_transaction)
 
-    depassement = df_merged[df_merged['Quantity'] > df_merged['Cap-rèservoir']].copy()
+    # Pour les dépassements de capacité, exclure les transactions annulées
+    depassement = df_merged_sorted[
+        (df_merged_sorted['Quantity'] > df_merged_sorted['Cap-rèservoir']) & 
+        (~df_merged_sorted['transaction_annulee'])
+    ].copy()
+    
     if not depassement.empty:
          depassement['type_anomalie'] = 'Dépassement capacité'
-         depassement['detail_anomalie'] = depassement.apply(lambda x: f"Volume: {x['Quantity']:.1f}L > Capacité: {x['Cap-rèservoir']:.1f}L", axis=1)
+         depassement['detail_anomalie'] = depassement.apply(
+             lambda x: f"Volume: {x['Quantity']:.1f}L > Capacité: {x['Cap-rèservoir']:.1f}L", 
+             axis=1
+         )
          depassement['poids_anomalie'] = st.session_state.get('ss_poids_depassement_capacite', DEFAULT_POIDS_DEPASSEMENT_CAPACITE)
          all_anomalies.extend(depassement.to_dict('records'))
 
-    # Pour le reste des anomalies, on utilise df_merged_sorted déjà trié
+    # Pour les prises rapprochées, exclure les transactions annulées
     rapprochees_indices = set()
+    capacite_depassee_indices = set()
+    
     for carte in df_merged_sorted['Card num.'].unique():
-        sub = df_merged_sorted[df_merged_sorted['Card num.'] == carte]
+        # Filtrer pour exclure les transactions annulées
+        sub = df_merged_sorted[(df_merged_sorted['Card num.'] == carte) & (~df_merged_sorted['transaction_annulee'])]
         if len(sub) > 1:
+            # Méthode 1: Détection basée sur la différence de temps
             time_diff = sub['DateTime'].diff().dt.total_seconds() / 3600
             indices_anomalie = sub.index[time_diff < seuil_heures_rapprochees]
             indices_precedents = sub.index[time_diff.shift(-1) < seuil_heures_rapprochees]
             rapprochees_indices.update(indices_anomalie)
             rapprochees_indices.update(indices_precedents)
+            
+            # Méthode 2: Pour chaque paire de transactions rapprochées
+            for i in range(len(sub) - 1):
+                for j in range(i+1, len(sub)):
+                    rowA = sub.iloc[i]
+                    rowB = sub.iloc[j]
+                    delta_sec = (rowB['DateTime'] - rowA['DateTime']).total_seconds()
+                    
+                    # Vérifier si les transactions sont rapprochées (sans être des annulations)
+                    if delta_sec >= 0 and (delta_sec / 3600.0) < seuil_heures_rapprochees:
+                        # Si les deux transactions ne sont pas des annulations
+                        if not (rowA['transaction_annulee'] or rowB['transaction_annulee']):
+                            # Vérifier si le total dépasse la capacité
+                            total_quantity = rowA['Quantity'] + rowB['Quantity']
+                            if total_quantity > rowA['Cap-rèservoir'] and rowA['Cap-rèservoir'] > 0:
+                                capacite_depassee_indices.add(sub.index[i])
+                                capacite_depassee_indices.add(sub.index[j])
+                                # Créer une anomalie pour cette paire
+                                anomalie = rowB.to_dict()
+                                anomalie['type_anomalie'] = 'Dépassement capacité sur prises rapprochées'
+                                anomalie['detail_anomalie'] = f"Total: {total_quantity:.1f}L (prises à {delta_sec/60:.0f}min) > Capacité: {rowA['Cap-rèservoir']:.1f}L"
+                                anomalie['poids_anomalie'] = st.session_state.get('ss_poids_depassement_capacite', DEFAULT_POIDS_DEPASSEMENT_CAPACITE) + 1
+                                all_anomalies.append(anomalie)
 
     if rapprochees_indices:
         rapprochees_df = df_merged_sorted.loc[list(rapprochees_indices)].copy()
@@ -577,6 +640,7 @@ def detecter_anomalies(
         rapprochees_df['poids_anomalie'] = st.session_state.get('ss_poids_prises_rapprochees', DEFAULT_POIDS_PRISES_RAPPROCHEES)
         all_anomalies.extend(rapprochees_df.to_dict('records'))
 
+    # Pour les kilométrages inchangés, exclure les transactions annulées
     km_anomalies = []
     for carte in df_merged_sorted['Card num.'].unique():
         df_carte = df_merged_sorted[df_merged_sorted['Card num.'] == carte]
@@ -585,52 +649,60 @@ def detecter_anomalies(
         for index, row in df_carte.iterrows():
             curr_m = row['Current mileage']
             past_m = row['Past mileage']
-            user = row.get('Card name', 'N/A')
-
-            if pd.isna(curr_m) or curr_m == 0 or pd.isna(past_m) :
-                 prev_m = None
-                 prev_row = row
-                 continue
+            
+            if pd.isna(curr_m) or curr_m == 0 or pd.isna(past_m):
+                prev_m = None
+                prev_row = row
+                continue
+                
             if past_m > curr_m:
-                 anomalie = row.to_dict()
-                 anomalie['type_anomalie'] = 'Kilométrage incohérent (transaction)'
-                 anomalie['detail_anomalie'] = f"Km début ({past_m}) > Km fin ({curr_m})"
-                 anomalie['poids_anomalie'] = st.session_state.get('ss_poids_km_decroissant', DEFAULT_POIDS_KM_DECROISSANT)
-                 km_anomalies.append(anomalie)
-                 prev_m = None
-                 prev_row = row
-                 continue
+                # Vérifier si c'est une annulation avant de l'ajouter comme anomalie
+                if not row['transaction_annulee']:
+                    anomalie = row.to_dict()
+                    anomalie['type_anomalie'] = 'Kilométrage incohérent (transaction)'
+                    anomalie['detail_anomalie'] = f"Km début ({past_m}) > Km fin ({curr_m})"
+                    anomalie['poids_anomalie'] = st.session_state.get('ss_poids_km_decroissant', DEFAULT_POIDS_KM_DECROISSANT)
+                    km_anomalies.append(anomalie)
+                prev_m = None
+                prev_row = row
+                continue
+                
             if prev_m is not None and prev_row is not None:
-                 if curr_m < prev_m:
-                     anomalie = row.to_dict()
-                     anomalie['type_anomalie'] = 'Kilométrage décroissant (inter-transactions)'
-                     anomalie['detail_anomalie'] = f"Km transaction N ({curr_m}) < Km transaction N-1 ({prev_m})"
-                     anomalie['poids_anomalie'] = st.session_state.get('ss_poids_km_decroissant', DEFAULT_POIDS_KM_DECROISSANT)
-                     km_anomalies.append(anomalie)
-                 elif curr_m == prev_m:
-                     anomalie = row.to_dict()
-                     anomalie['type_anomalie'] = 'Kilométrage inchangé (inter-transactions)'
-                     anomalie['detail_anomalie'] = f"Km identique à la transaction précédente: {curr_m} km"
-                     anomalie['poids_anomalie'] = st.session_state.get('ss_poids_km_inchange', DEFAULT_POIDS_KM_INCHANGE)
-                     km_anomalies.append(anomalie)
-                 elif (curr_m - prev_m) > 1000:
-                     anomalie = row.to_dict()
-                     anomalie['type_anomalie'] = 'Saut kilométrage important'
-                     anomalie['detail_anomalie'] = f"Augmentation de +{curr_m - prev_m} km depuis transaction précédente"
-                     anomalie['poids_anomalie'] = st.session_state.get('ss_poids_km_saut', DEFAULT_POIDS_KM_SAUT)
-                     km_anomalies.append(anomalie)
+                # Vérifier si l'une des transactions est une annulation
+                transaction_actuelle_ou_precedente_annulee = row['transaction_annulee'] or prev_row['transaction_annulee']
+                
+                if curr_m < prev_m and not transaction_actuelle_ou_precedente_annulee:
+                    anomalie = row.to_dict()
+                    anomalie['type_anomalie'] = 'Kilométrage décroissant (inter-transactions)'
+                    anomalie['detail_anomalie'] = f"Km transaction N ({curr_m}) < Km transaction N-1 ({prev_m})"
+                    anomalie['poids_anomalie'] = st.session_state.get('ss_poids_km_decroissant', DEFAULT_POIDS_KM_DECROISSANT)
+                    km_anomalies.append(anomalie)
+                elif curr_m == prev_m and not transaction_actuelle_ou_precedente_annulee:
+                    anomalie = row.to_dict()
+                    anomalie['type_anomalie'] = 'Kilométrage inchangé (inter-transactions)'
+                    anomalie['detail_anomalie'] = f"Km identique à la transaction précédente: {curr_m} km"
+                    anomalie['poids_anomalie'] = st.session_state.get('ss_poids_km_inchange', DEFAULT_POIDS_KM_INCHANGE)
+                    km_anomalies.append(anomalie)
+                elif (curr_m - prev_m) > 1000 and not transaction_actuelle_ou_precedente_annulee:
+                    anomalie = row.to_dict()
+                    anomalie['type_anomalie'] = 'Saut kilométrage important'
+                    anomalie['detail_anomalie'] = f"Augmentation de +{curr_m - prev_m} km depuis transaction précédente"
+                    anomalie['poids_anomalie'] = st.session_state.get('ss_poids_km_saut', DEFAULT_POIDS_KM_SAUT)
+                    km_anomalies.append(anomalie)
             prev_m = curr_m
             prev_row = row
     all_anomalies.extend(km_anomalies)
 
-    df_merged['heure'] = df_merged['DateTime'].dt.hour
-    df_merged['jour_semaine'] = df_merged['DateTime'].dt.dayofweek
+    df_merged_sorted['heure'] = df_merged_sorted['DateTime'].dt.hour
+    df_merged_sorted['jour_semaine'] = df_merged_sorted['DateTime'].dt.dayofweek
     if heure_debut_non_ouvre < heure_fin_non_ouvre:
-        cond_heure = (df_merged['heure'] < heure_fin_non_ouvre) | (df_merged['heure'] >= heure_debut_non_ouvre)
+        cond_heure = (df_merged_sorted['heure'] < heure_fin_non_ouvre) | (df_merged_sorted['heure'] >= heure_debut_non_ouvre)
     else:
-        cond_heure = (df_merged['heure'] >= heure_debut_non_ouvre) | (df_merged['heure'] < heure_fin_non_ouvre)
-    cond_weekend = (df_merged['jour_semaine'] >= 5)
-    anomalies_hor = df_merged[cond_heure | cond_weekend].copy()
+        cond_heure = (df_merged_sorted['heure'] >= heure_debut_non_ouvre) | (df_merged_sorted['heure'] < heure_fin_non_ouvre)
+    cond_weekend = (df_merged_sorted['jour_semaine'] >= 5)
+    
+    # Pour les anomalies d'horaires, exclure les transactions annulées
+    anomalies_hor = df_merged_sorted[(cond_heure | cond_weekend) & (~df_merged_sorted['transaction_annulee'])].copy()
     if not anomalies_hor.empty:
         anomalies_hor['type_anomalie'] = 'Hors Horaires / Weekend'
         anomalies_hor['detail_anomalie'] = anomalies_hor.apply(
@@ -642,16 +714,22 @@ def detecter_anomalies(
         anomalies_hor['poids_anomalie'] = st.session_state.get('ss_poids_hors_horaire', DEFAULT_POIDS_HORS_HORAIRE)
         all_anomalies.extend(anomalies_hor.to_dict('records'))
 
-    hors_service = df_merged[df_merged['Type'].isin(['EN PANNE', 'IMMO'])].copy()
+    # Pour les véhicules hors service, exclure les transactions annulées
+    hors_service = df_merged_sorted[
+        df_merged_sorted['Type'].isin(['EN PANNE', 'IMMO']) & 
+        (~df_merged_sorted['transaction_annulee'])
+    ].copy()
     if not hors_service.empty:
         hors_service['type_anomalie'] = 'Véhicule Hors Service'
         hors_service['detail_anomalie'] = 'Transaction alors que véhicule EN PANNE ou IMMO'
         hors_service['poids_anomalie'] = st.session_state.get('ss_poids_hors_service', DEFAULT_POIDS_HORS_SERVICE)
         all_anomalies.extend(hors_service.to_dict('records'))
 
+    # Pour les facturations doubles, exclure les transactions annulées
     double_indices = set()
     for carte in df_merged_sorted['Card num.'].unique():
-        sub = df_merged_sorted[df_merged_sorted['Card num.'] == carte]
+        # Filtrer pour exclure les transactions annulées
+        sub = df_merged_sorted[(df_merged_sorted['Card num.'] == carte) & (~df_merged_sorted['transaction_annulee'])]
         if len(sub) > 1:
             for i in range(len(sub) - 1):
                 rowA = sub.iloc[i]
@@ -664,7 +742,7 @@ def detecter_anomalies(
     if double_indices:
         doubles_df = df_merged_sorted.loc[list(double_indices)].copy()
         doubles_df['type_anomalie'] = 'Facturation double suspectée'
-        doubles_df['detail_anomalie'] = f"Montant identique ({doubles_df['Amount']}) en < {delta_minutes_double} min"
+        doubles_df['detail_anomalie'] = f"Montant identique en < {delta_minutes_double} min"
         doubles_df['poids_anomalie'] = st.session_state.get('ss_poids_fact_double', DEFAULT_POIDS_FACT_DOUBLE)
         all_anomalies.extend(doubles_df.to_dict('records'))
 
@@ -684,6 +762,89 @@ def detecter_anomalies(
     cols_final = [col for col in cols_to_keep if col in df_final_anomalies.columns]
     df_final_anomalies = df_final_anomalies[cols_final]
     return df_final_anomalies.sort_values(by=['Nouveau Immat', 'DateTime', 'type_anomalie'])
+
+def analyser_stations_risque(df_anomalies: pd.DataFrame, df_transactions: pd.DataFrame) -> pd.DataFrame:
+    """
+    Analyse les stations en fonction des anomalies détectées pour identifier celles présentant 
+    des risques élevés de fraude.
+    
+    Args:
+        df_anomalies: DataFrame des anomalies détectées
+        df_transactions: DataFrame complet des transactions
+        
+    Returns:
+        DataFrame des stations classées par niveau de risque
+    """
+    if df_anomalies.empty or 'Place' not in df_anomalies.columns:
+        return pd.DataFrame()
+    
+    # Compter le nombre total de transactions par station
+    transactions_par_station = df_transactions.groupby('Place').agg(
+        Nb_Total_Transactions=('Amount', 'count'),
+        Volume_Total=('Quantity', 'sum'),
+        Montant_Total=('Amount', 'sum')
+    ).reset_index()
+    
+    # Compter le nombre d'anomalies par station et par type
+    anomalies_par_station = df_anomalies.groupby(['Place', 'type_anomalie']).size().reset_index(name='Nb_Anomalies')
+    
+    # Types d'anomalies liées à la fraude potentielle par carte
+    types_fraude_carte = [
+        'Dépassement capacité', 
+        'Prises rapprochées', 
+        'Facturation double suspectée',
+        'Transaction sans présence (géoloc)',
+        'Véhicule Hors Service'
+    ]
+    
+    # Filtrer pour ne garder que les anomalies liées à la fraude par carte
+    anomalies_fraude = anomalies_par_station[anomalies_par_station['type_anomalie'].isin(types_fraude_carte)]
+    
+    # Agréger par station
+    resume_stations = anomalies_fraude.groupby('Place').agg(
+        Nb_Anomalies_Fraude=('Nb_Anomalies', 'sum')
+    ).reset_index()
+    
+    # Fusionner avec les statistiques générales des transactions
+    resume_complet = resume_stations.merge(
+        transactions_par_station, on='Place', how='left'
+    )
+    
+    # Calculer le pourcentage d'anomalies
+    resume_complet['Pourcentage_Anomalies'] = np.where(
+        resume_complet['Nb_Total_Transactions'] > 0,
+        (resume_complet['Nb_Anomalies_Fraude'] / resume_complet['Nb_Total_Transactions']) * 100,
+        0
+    )
+    
+    # Calculer un score de risque (formule pondérée)
+    resume_complet['Score_Risque_Station'] = resume_complet['Pourcentage_Anomalies'] * np.log1p(resume_complet['Nb_Anomalies_Fraude'])
+    
+    # Déterminer le niveau de risque
+    resume_complet['Niveau_Risque'] = pd.cut(
+        resume_complet['Score_Risque_Station'],
+        bins=[-float('inf'), 5, 10, 20, float('inf')],
+        labels=['Faible', 'Modéré', 'Élevé', 'Critique']
+    )
+    
+    # Récupérer les types d'anomalies les plus fréquents par station
+    anomalies_principales = {}
+    for station in resume_complet['Place'].unique():
+        top_anomalies = anomalies_fraude[anomalies_fraude['Place'] == station].sort_values('Nb_Anomalies', ascending=False)
+        if not top_anomalies.empty:
+            top_types = top_anomalies.head(2)['type_anomalie'].tolist()
+            anomalies_principales[station] = " + ".join(top_types)
+        else:
+            anomalies_principales[station] = "N/A"
+    
+    resume_complet['Anomalies_Principales'] = resume_complet['Place'].map(anomalies_principales)
+    
+    # Arrondir les valeurs numériques
+    resume_complet['Pourcentage_Anomalies'] = resume_complet['Pourcentage_Anomalies'].round(1)
+    resume_complet['Score_Risque_Station'] = resume_complet['Score_Risque_Station'].round(1)
+    
+    # Trier par score de risque décroissant
+    return resume_complet.sort_values('Score_Risque_Station', ascending=False)
     
 def analyser_stations_risque(df_anomalies: pd.DataFrame, df_transactions: pd.DataFrame) -> pd.DataFrame:
     """
@@ -5705,30 +5866,99 @@ def detecter_anomalies_geolocalisation(
 # ---------------------------------------------------------------------
 
 def afficher_page_dashboard(df_transactions: pd.DataFrame, df_vehicules: pd.DataFrame, df_ge: pd.DataFrame, df_autres: pd.DataFrame, date_debut: datetime.date, date_fin: datetime.date, df_geoloc: Optional[pd.DataFrame] = None):
-    """Affiche le tableau de bord principal."""
+    """Affiche le tableau de bord principal avec des KPIs améliorés et une analyse avancée de consommation."""
     st.header(f"📊 Tableau de Bord Principal ({date_debut.strftime('%d/%m/%Y')} - {date_fin.strftime('%d/%m/%Y')})")
 
     if df_transactions.empty:
         st.warning("Aucune transaction à analyser pour la période sélectionnée.")
         return
 
+    # Statistiques globales de base
     total_volume = df_transactions['Quantity'].sum()
     total_cout = df_transactions['Amount'].sum()
-    nb_transactions_total = len(df_transactions) # Renommé
+    nb_transactions_total = len(df_transactions)
     cartes_veh_actives = df_transactions[df_transactions['Card num.'].isin(df_vehicules['N° Carte'])]['Card num.'].nunique()
     prix_moyen_litre_global = (total_cout / total_volume) if total_volume > 0 else 0
 
+    # AMÉLIORATION: Calcul avancé de consommation avec différentes méthodes
+    vehicle_data = []
+    methodes_utilisees = {'simple': 0, 'cumulative': 0, 'hybride': 0, 'ajustee': 0, 'insuffisant': 0}
+    total_volume_ajuste = 0
+    total_distance = 0
+    
+    merged_df = df_transactions.merge(
+        df_vehicules[['N° Carte', 'Nouveau Immat', 'Catégorie']],
+        left_on='Card num.',
+        right_on='N° Carte',
+        how='inner'
+    )
+    
+    for card, group in merged_df.groupby('Card num.'):
+        # Trier par date
+        group_sorted = group.sort_values('DateTime')
+        if len(group_sorted) > 1:
+            # Calculer avec les différentes méthodes
+            distance_simple, distance_cumulative, consommation_recommandee, methode_utilisee = calculer_distance_et_consommation(group_sorted)
+            
+            # Compter les méthodes utilisées
+            methodes_utilisees[methode_utilisee] += 1
+            
+            # Extraire les informations du véhicule
+            category = group_sorted['Catégorie'].iloc[0]
+            vehicle = group_sorted['Nouveau Immat'].iloc[0]
+            total_vol = group_sorted['Quantity'].sum()
+            total_cost = group_sorted['Amount'].sum()
+            
+            # Pour le volume ajusté, exclure le dernier plein si méthode=ajustee
+            volume_ajuste = total_vol
+            if methode_utilisee == "ajustee" and len(group_sorted) > 1:
+                volume_ajuste = group_sorted.iloc[:-1]['Quantity'].sum()
+            
+            total_volume_ajuste += volume_ajuste
+            
+            # Utiliser la meilleure distance disponible
+            if distance_simple > 0 or distance_cumulative > 0:
+                distance_utilisee = max(distance_simple, distance_cumulative)
+                total_distance += distance_utilisee
+                cpk = (total_cost / distance_utilisee) if distance_utilisee > 0 else 0
+                
+                vehicle_data.append({
+                    'Card num.': card,
+                    'Nouveau Immat': vehicle,
+                    'Catégorie': category,
+                    'Volume_Total': total_vol,
+                    'Volume_Ajuste': volume_ajuste,
+                    'Montant_Total': total_cost,
+                    'Distance': distance_utilisee,
+                    'Consommation': consommation_recommandee,
+                    'Cout_km': cpk,
+                    'Methode': methode_utilisee
+                })
+    
+    # Créer DataFrame des analyses par véhicule
+    df_vehicle_analyse = pd.DataFrame(vehicle_data)
+    
+    # Calculer KPIs globaux avec la méthode avancée
+    if total_distance > 0:
+        conso_moyenne_ajustee = (total_volume_ajuste / total_distance) * 100
+        cout_km_global = total_cout / total_distance
+    else:
+        conso_moyenne_ajustee = 0
+        cout_km_global = 0
+
+    # Calculer également les KPIs classiques par catégorie
     kpi_cat_dash, df_vehicle_kpi_dash = calculer_kpis_globaux(df_transactions, df_vehicules, date_debut, date_fin, list(st.session_state.ss_conso_seuils_par_categorie.keys()))
     conso_moyenne_globale = (kpi_cat_dash['total_litres'].sum() / kpi_cat_dash['distance_totale'].sum()) * 100 if not kpi_cat_dash.empty and kpi_cat_dash['distance_totale'].sum() > 0 else 0
-    cout_km_global = (kpi_cat_dash['total_cout'].sum() / kpi_cat_dash['distance_totale'].sum()) if not kpi_cat_dash.empty and kpi_cat_dash['distance_totale'].sum() > 0 else 0
 
+    # Détection des anomalies
     df_anomalies_dash = detecter_anomalies(df_transactions, df_vehicules)
     cartes_inconnues_dash = verifier_cartes_inconnues(df_transactions, df_vehicules, df_ge, df_autres)
     vehicules_risques_dash = calculer_score_risque(df_anomalies_dash)
     nb_vehicules_suspects = len(vehicules_risques_dash[vehicules_risques_dash['score_risque'] >= st.session_state.ss_seuil_anomalies_suspectes_score]) if not vehicules_risques_dash.empty else 0
     nb_anomalies_critiques = len(df_anomalies_dash[df_anomalies_dash['poids_anomalie'] >= 8]) if not df_anomalies_dash.empty else 0
 
-    nb_anomalies_geoloc_dash = 0 # Initialisation
+    # Anomalies de géolocalisation
+    nb_anomalies_geoloc_dash = 0
     anomalies_geoloc_dash_df = pd.DataFrame()
     if df_geoloc is not None and not df_geoloc.empty:
         with st.spinner("Analyse des anomalies de géolocalisation (dashboard)..."):
@@ -5737,94 +5967,434 @@ def afficher_page_dashboard(df_transactions: pd.DataFrame, df_vehicules: pd.Data
             )
             nb_anomalies_geoloc_dash = len(anomalies_geoloc_dash_df)
 
-
-    st.subheader("🚀 Indicateurs Clés")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Volume Total", f"{total_volume:,.0f} L")
-    col2.metric("Coût Total", f"{total_cout:,.0f} CFA")
-    col3.metric("Transactions", f"{nb_transactions_total:,}")
-    col4.metric("Véhicules Actifs", f"{cartes_veh_actives:,}")
-
-    col5, col6, col7, col8 = st.columns(4)
-    col5.metric("Conso. Moyenne Globale", f"{conso_moyenne_globale:.1f} L/100km" if conso_moyenne_globale else "N/A")
-    col6.metric("Coût Moyen / Km Global", f"{cout_km_global:.1f} CFA/km" if cout_km_global else "N/A")
-    col7.metric("Prix Moyen / Litre", f"{prix_moyen_litre_global:,.0f} CFA/L" if prix_moyen_litre_global else "N/A")
-
-    if df_geoloc is not None and not df_geoloc.empty:
-        col8.metric("Anomalies Géoloc", f"{nb_anomalies_geoloc_dash:,}", delta_color="inverse")
-    else:
-        col8.metric("Anomalies Géoloc", "N/A")
-
-
-    st.subheader("⚠️ Alertes Rapides")
-    col_a1, col_a2, col_a3 = st.columns(3)
-    col_a1.metric("Cartes Inconnues", len(cartes_inconnues_dash), delta_color="inverse")
-    col_a2.metric(f"Véhicules Suspects (Score > {st.session_state.ss_seuil_anomalies_suspectes_score})", nb_vehicules_suspects, delta_color="inverse")
-    col_a3.metric("Anomalies Critiques (Poids >= 8)", nb_anomalies_critiques, delta_color="inverse")
-
-    st.subheader("📈 Graphiques Clés")
-    with st.expander("Évolution Mensuelle Volume & Coût", expanded=True):
+    # AFFICHAGE DU TABLEAU DE BORD AMÉLIORÉ
+    # Création d'onglets pour mieux organiser l'information
+    tab_apercu, tab_conso, tab_anomalies, tab_vehicles = st.tabs([
+        "📊 Aperçu Global", "⛽ Consommation", "🚨 Anomalies", "🚗 Véhicules"
+    ])
+    
+    with tab_apercu:
+        st.subheader("🚀 Indicateurs Clés")
+        
+        # Première ligne de métriques principales
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Volume Total", f"{total_volume:,.0f} L")
+        col2.metric("Coût Total", f"{total_cout:,.0f} CFA")
+        col3.metric("Transactions", f"{nb_transactions_total:,}")
+        col4.metric("Véhicules Actifs", f"{cartes_veh_actives:,}")
+        
+        # Deuxième ligne de métriques avancées
+        col5, col6, col7, col8 = st.columns(4)
+        
+        # AMÉLIORATION: Afficher à la fois la conso standard et ajustée
+        col5.metric(
+            "Conso. Moyenne (Standard)", 
+            f"{conso_moyenne_globale:.1f} L/100km" if conso_moyenne_globale else "N/A"
+        )
+        
+        col6.metric(
+            "Conso. Moyenne (Ajustée)", 
+            f"{conso_moyenne_ajustee:.1f} L/100km" if conso_moyenne_ajustee else "N/A",
+            help="Basée sur la méthode de calcul la plus précise pour chaque véhicule"
+        )
+        
+        col7.metric("Coût Moyen / Km", f"{cout_km_global:.1f} CFA/km" if cout_km_global else "N/A")
+        col8.metric("Prix Moyen / Litre", f"{prix_moyen_litre_global:,.0f} CFA/L" if prix_moyen_litre_global else "N/A")
+        
+        # Alertes rapides
+        st.subheader("⚠️ Alertes Rapides")
+        col_a1, col_a2, col_a3, col_a4 = st.columns(4)
+        col_a1.metric("Cartes Inconnues", len(cartes_inconnues_dash), delta_color="inverse")
+        col_a2.metric(f"Véhicules Suspects (Score > {st.session_state.ss_seuil_anomalies_suspectes_score})", nb_vehicules_suspects, delta_color="inverse")
+        col_a3.metric("Anomalies Critiques (Poids ≥ 8)", nb_anomalies_critiques, delta_color="inverse")
+        
+        if df_geoloc is not None and not df_geoloc.empty:
+            col_a4.metric("Anomalies Géoloc", f"{nb_anomalies_geoloc_dash:,}", delta_color="inverse")
+        else:
+            col_a4.metric("Anomalies Géoloc", "N/A")
+        
+        # AMÉLIORATION: Ajouter la répartition des méthodes de calcul
+        if not df_vehicle_analyse.empty:
+            # Filtrer pour inclure uniquement les méthodes utilisées
+            methodes_df = pd.DataFrame({
+                'Méthode': list(methodes_utilisees.keys()),
+                'Nombre de Véhicules': list(methodes_utilisees.values())
+            })
+            methodes_df = methodes_df[methodes_df['Nombre de Véhicules'] > 0]
+            
+            st.subheader("📊 Méthodes de Calcul Utilisées")
+            
+            col_m1, col_m2 = st.columns([1, 2])
+            
+            with col_m1:
+                st.dataframe(methodes_df)
+            
+            with col_m2:
+                if not methodes_df.empty and methodes_df['Nombre de Véhicules'].sum() > 0:
+                    fig_methodes = px.pie(
+                        methodes_df, 
+                        values='Nombre de Véhicules', 
+                        names='Méthode',
+                        title="Répartition des Méthodes de Calcul",
+                        color_discrete_map={
+                            'simple': '#fff5e6',
+                            'cumulative': '#fff2e6',
+                            'hybride': '#e6f3ff',
+                            'ajustee': '#e6ffec',
+                            'insuffisant': '#f8f8f8'
+                        }
+                    )
+                    st.plotly_chart(fig_methodes, use_container_width=True)
+        
+        # Graphiques d'évolution mensuelle
+        st.subheader("📈 Évolution Mensuelle")
+        
         evo_mensuelle = df_transactions.groupby(pd.Grouper(key='Date', freq='M')).agg(
             Volume_L=('Quantity', 'sum'),
-            Cout_CFA=('Amount', 'sum')
+            Cout_CFA=('Amount', 'sum'),
+            Nb_Transactions=('Quantity', 'count')
         ).reset_index()
+        
         evo_mensuelle['Mois'] = evo_mensuelle['Date'].dt.strftime('%Y-%m')
-        fig_evo = px.bar(evo_mensuelle, x='Mois', y=['Volume_L', 'Cout_CFA'],
-                         title="Évolution Mensuelle du Volume et du Coût",
-                         labels={'value': 'Valeur', 'variable': 'Indicateur'}, barmode='group')
-        fig_evo.update_layout(yaxis_title="Volume (L) / Coût (CFA)")
+        evo_mensuelle['Prix_Moyen_Litre'] = evo_mensuelle['Cout_CFA'] / evo_mensuelle['Volume_L']
+        
+        # AMÉLIORATION: Afficher un graphique plus complet avec prix moyen par litre
+        fig_evo = make_subplots(specs=[[{"secondary_y": True}]])
+        
+        # Ajouter les barres de volume et coût
+        fig_evo.add_trace(
+            go.Bar(
+                x=evo_mensuelle['Mois'], 
+                y=evo_mensuelle['Volume_L'],
+                name="Volume (L)",
+                marker_color='blue'
+            ),
+            secondary_y=False
+        )
+        
+        fig_evo.add_trace(
+            go.Bar(
+                x=evo_mensuelle['Mois'], 
+                y=evo_mensuelle['Cout_CFA'],
+                name="Coût (CFA)",
+                marker_color='orange'
+            ),
+            secondary_y=False
+        )
+        
+        # Ajouter la ligne de prix moyen
+        fig_evo.add_trace(
+            go.Scatter(
+                x=evo_mensuelle['Mois'], 
+                y=evo_mensuelle['Prix_Moyen_Litre'],
+                name="Prix Moyen (CFA/L)",
+                mode='lines+markers',
+                line=dict(color='red', width=2)
+            ),
+            secondary_y=True
+        )
+        
+        fig_evo.update_layout(
+            title="Évolution Mensuelle du Volume, Coût et Prix Moyen",
+            barmode='group',
+            yaxis=dict(title="Volume (L) / Coût (CFA)"),
+            yaxis2=dict(title="Prix Moyen (CFA/L)", showgrid=False)
+        )
+        
         st.plotly_chart(fig_evo, use_container_width=True)
-
-    with st.expander("Répartition par Catégorie de Véhicule", expanded=False):
+        
+    with tab_conso:
+        st.subheader("⛽ Analyse de Consommation")
+        
+        # Répartition par catégorie
         if not kpi_cat_dash.empty:
-             col_g1, col_g2 = st.columns(2)
-             fig_pie_vol = px.pie(kpi_cat_dash, values='total_litres', names='Catégorie', title='Répartition Volume par Catégorie')
-             col_g1.plotly_chart(fig_pie_vol, use_container_width=True)
-             fig_pie_cout = px.pie(kpi_cat_dash, values='total_cout', names='Catégorie', title='Répartition Coût par Catégorie')
-             col_g2.plotly_chart(fig_pie_cout, use_container_width=True)
-        else:
-             st.info("Données insuffisantes pour la répartition par catégorie.")
+            st.subheader("Consommation par Catégorie de Véhicule")
+            
+            # AMÉLIORATION: Visualisation par catégorie plus informative
+            fig_cat = px.bar(
+                kpi_cat_dash,
+                x='Catégorie',
+                y=['consommation_moyenne', 'consommation_globale'],
+                title="Consommation par Catégorie (L/100km)",
+                barmode='group',
+                color_discrete_map={
+                    'consommation_moyenne': 'blue',
+                    'consommation_globale': 'green'
+                },
+                labels={
+                    'value': 'Consommation (L/100km)',
+                    'variable': 'Type'
+                }
+            )
+            
+            st.plotly_chart(fig_cat, use_container_width=True)
+            
+            # Table des KPIs par catégorie
+            kpi_display = kpi_cat_dash.copy()
+            kpi_display.rename(columns={
+                'consommation_moyenne': 'Conso. Moyenne (L/100km)',
+                'cout_par_km_moyen': 'Coût/km (CFA)',
+                'total_litres': 'Volume Total (L)',
+                'total_cout': 'Coût Total (CFA)',
+                'distance_totale': 'Distance Totale (km)',
+                'nb_vehicules': 'Nb Véhicules',
+                'nb_transactions': 'Nb Transactions'
+            }, inplace=True)
+            
+            st.dataframe(kpi_display, use_container_width=True)
+            
+        # AMÉLIORATION: Analyse de la consommation des véhicules
+        if not df_vehicle_analyse.empty:
+            st.subheader("Top 10 Véhicules par Consommation")
+            
+            # Trier les véhicules par consommation
+            top_conso_vehicles = df_vehicle_analyse.sort_values('Consommation', ascending=False).head(10)
+            
+            # AMÉLIORATION: Graphique plus informatif avec la méthode de calcul
+            fig_top_conso = px.bar(
+                top_conso_vehicles,
+                x='Nouveau Immat',
+                y='Consommation',
+                color='Methode',
+                title="Top 10 des Véhicules par Consommation",
+                labels={'Consommation': 'Consommation (L/100km)'},
+                hover_data=['Catégorie', 'Volume_Total', 'Distance'],
+                color_discrete_map={
+                    'simple': '#fff5e6',
+                    'cumulative': '#fff2e6',
+                    'hybride': '#e6f3ff',
+                    'ajustee': '#e6ffec',
+                    'insuffisant': '#f8f8f8'
+                }
+            )
+            
+            st.plotly_chart(fig_top_conso, use_container_width=True)
+        
+        # Ajouter l'excès de consommation (repris de ameliorer_dashboard)
+        with st.expander("⚠️ Aperçu des Excès de Consommation (Mensuel)", expanded=True):
+            _, conso_veh_mois = analyser_consommation_par_periode(
+                df_transactions, df_vehicules, date_debut, date_fin,
+                periode='M', selected_categories=None, selected_vehicles=None
+            )
+            if not conso_veh_mois.empty:
+                exces_mois = conso_veh_mois[conso_veh_mois['exces_consommation'] > 0]
+                if not exces_mois.empty:
+                    nb_exces_mois = len(exces_mois)
+                    nb_vehicules_exces = exces_mois['Nouveau Immat'].nunique()
 
-    with st.expander("Top 5 Véhicules (Coût / Volume / Anomalies)", expanded=False):
-        if not df_vehicle_kpi_dash.empty:
-             col_t1, col_t2 = st.columns(2)
-             top_cout = df_vehicle_kpi_dash.nlargest(5, 'total_cout')[['Nouveau Immat', 'total_cout']]
-             top_volume = df_vehicle_kpi_dash.nlargest(5, 'total_litres')[['Nouveau Immat', 'total_litres']]
-             with col_t1: # Afficher dans les colonnes pour un meilleur layout
-                afficher_dataframe_avec_export(top_cout, "Top 5 Coût Total", key="dash_top_cout")
-             with col_t2:
-                afficher_dataframe_avec_export(top_volume, "Top 5 Volume Total", key="dash_top_vol")
-        else:
-            st.info("Données insuffisantes pour le classement des véhicules.")
+                    col_e1, col_e2, col_e3 = st.columns(3)
+                    col_e1.metric("Nombre d'Excès Détectés", f"{nb_exces_mois}")
+                    col_e2.metric("Véhicules Concernés", f"{nb_vehicules_exces}")
+                    col_e3.metric("Excès Moyen", f"{exces_mois['pourcentage_exces'].mean():.1f}%")
 
-        if not vehicules_risques_dash.empty:
-             top_risque = vehicules_risques_dash.nlargest(5, 'score_risque')[['Nouveau Immat', 'score_risque', 'nombre_total_anomalies']]
-             afficher_dataframe_avec_export(top_risque, "Top 5 Score Risque", key="dash_top_risque")
-        else:
-             st.info("Aucune anomalie de transaction détectée pour le classement par risque.")
-
-    if not cartes_inconnues_dash.empty:
-        with st.expander("🚨 Cartes Inconnues Détectées", expanded=False):
-            afficher_dataframe_avec_export(cartes_inconnues_dash, "Détail des Cartes Inconnues", key="dash_cartes_inconnues")
-
-    # Aperçu des anomalies de géolocalisation
-    if df_geoloc is not None and not df_geoloc.empty and not anomalies_geoloc_dash_df.empty:
-        with st.expander("🚨 Aperçu des Anomalies de Géolocalisation", expanded=True):
+                    top_exces = exces_mois.nlargest(5, 'pourcentage_exces')
+                    top_exces_display = top_exces[[
+                        'periode_str', 'Nouveau Immat', 'consommation_moyenne',
+                        'seuil_consommation', 'pourcentage_exces'
+                    ]]
+                    top_exces_display.columns = [
+                        'Période', 'Immatriculation', 'Consommation (L/100km)',
+                        'Seuil (L/100km)', 'Excès (%)'
+                    ]
+                    st.dataframe(top_exces_display, use_container_width=True)
+                    st.markdown("""
+                    👉 *Pour une analyse complète des excès de consommation, utilisez la page "Analyse par Période"*
+                    """)
+                else:
+                    st.success("✅ Aucun excès de consommation détecté pour les périodes analysées.")
+            else:
+                st.info("Données insuffisantes pour l'analyse des excès de consommation.")
+                
+    with tab_anomalies:
+        st.subheader("🚨 Analyse des Anomalies")
+        
+        # AMÉLIORATION: Analyse plus détaillée des anomalies
+        col_count1, col_count2 = st.columns(2)
+        
+        with col_count1:
+            if not df_anomalies_dash.empty:
+                # Compter les anomalies par type
+                anomaly_counts = df_anomalies_dash['type_anomalie'].value_counts().reset_index()
+                anomaly_counts.columns = ['Type Anomalie', 'Nombre']
+                
+                fig_anomalies = px.bar(
+                    anomaly_counts,
+                    x='Type Anomalie',
+                    y='Nombre',
+                    title="Répartition des Anomalies par Type",
+                    color='Nombre',
+                    color_continuous_scale='Reds'
+                )
+                
+                st.plotly_chart(fig_anomalies, use_container_width=True)
+            else:
+                st.success("✅ Aucune anomalie de transaction détectée.")
+                
+        with col_count2:
+            if not vehicules_risques_dash.empty:
+                # Top véhicules à risque
+                top_risque = vehicules_risques_dash.nlargest(10, 'score_risque')
+                
+                fig_risque = px.bar(
+                    top_risque,
+                    x='Nouveau Immat',
+                    y='score_risque',
+                    title="Top 10 des Véhicules à Risque",
+                    color='score_risque',
+                    color_continuous_scale='Reds',
+                    hover_data=['nombre_total_anomalies']
+                )
+                
+                st.plotly_chart(fig_risque, use_container_width=True)
+            else:
+                st.success("✅ Aucun véhicule à risque détecté.")
+        
+        # Anomalies de géolocalisation
+        if df_geoloc is not None and not df_geoloc.empty and not anomalies_geoloc_dash_df.empty:
+            st.subheader("Anomalies de Géolocalisation")
+            
+            # Résumé par type d'anomalie
             summary_geoloc_dash = anomalies_geoloc_dash_df.groupby('type_anomalie').agg(
                 Nombre=('type_anomalie', 'size'),
-                Score_Moyen=('poids_anomalie', 'mean') # poids_anomalie est le nom utilisé
+                Score_Moyen=('poids_anomalie', 'mean')
             ).reset_index().sort_values('Nombre', ascending=False)
-
-            afficher_dataframe_avec_export(summary_geoloc_dash, "Résumé Anomalies Géolocalisation (Dashboard)", key="dash_anomalies_geoloc")
-
-            fig_anomalies_geoloc_dash = px.bar(
+            
+            # AMÉLIORATION: Visualisation plus informative
+            fig_geo_anomalies = px.bar(
                 summary_geoloc_dash,
-                x='type_anomalie', y='Nombre', title="Anomalies de Géolocalisation par Type (Dashboard)",
-                color='Score_Moyen', labels={'Nombre': "Nombre d'occurrences"}
+                x='type_anomalie',
+                y='Nombre',
+                title="Anomalies de Géolocalisation par Type",
+                color='Score_Moyen',
+                color_continuous_scale='Oranges',
+                labels={'type_anomalie': "Type d'Anomalie", 'Nombre': "Nombre d'occurrences"}
             )
-            st.plotly_chart(fig_anomalies_geoloc_dash, use_container_width=True)
+            
+            st.plotly_chart(fig_geo_anomalies, use_container_width=True)
+            
+            # Top véhicules avec anomalies géoloc
+            if 'Véhicule' in anomalies_geoloc_dash_df.columns or 'Nouveau Immat' in anomalies_geoloc_dash_df.columns:
+                veh_col = 'Véhicule' if 'Véhicule' in anomalies_geoloc_dash_df.columns else 'Nouveau Immat'
+                
+                geo_anomalies_by_veh = anomalies_geoloc_dash_df.groupby(veh_col).agg(
+                    Nombre=('type_anomalie', 'size'),
+                    Score_Total=('poids_anomalie', 'sum')
+                ).reset_index().sort_values('Score_Total', ascending=False).head(10)
+                
+                if not geo_anomalies_by_veh.empty:
+                    fig_geo_veh = px.bar(
+                        geo_anomalies_by_veh,
+                        x=veh_col,
+                        y='Nombre',
+                        title="Top 10 des Véhicules avec Anomalies de Géolocalisation",
+                        color='Score_Total',
+                        color_continuous_scale='Oranges'
+                    )
+                    
+                    st.plotly_chart(fig_geo_veh, use_container_width=True)
+            
             st.markdown("""👉 *Pour une analyse détaillée des anomalies de géolocalisation, utilisez la page "Géolocalisation"*""")
-
+        
+        # Afficher les cartes inconnues
+        if not cartes_inconnues_dash.empty:
+            with st.expander("Détail des Cartes Inconnues", expanded=False):
+                afficher_dataframe_avec_export(cartes_inconnues_dash, "Cartes Inconnues", key="dash_cartes_inconnues")
+                
+    with tab_vehicles:
+        st.subheader("🚗 Aperçu des Véhicules")
+        
+        # Statistiques de la flotte
+        nb_total_veh = len(df_vehicules)
+        nb_actifs = cartes_veh_actives
+        taux_utilisation = (nb_actifs / nb_total_veh * 100) if nb_total_veh > 0 else 0
+        
+        col_v1, col_v2, col_v3 = st.columns(3)
+        col_v1.metric("Véhicules Total", f"{nb_total_veh}")
+        col_v2.metric("Véhicules Actifs", f"{nb_actifs}")
+        col_v3.metric("Taux d'Utilisation", f"{taux_utilisation:.1f}%")
+        
+        # Répartition par catégorie
+        categories_count = df_vehicules['Catégorie'].value_counts().reset_index()
+        categories_count.columns = ['Catégorie', 'Nombre']
+        
+        # Véhicules par catégorie actifs/inactifs
+        if not df_vehicle_kpi_dash.empty:
+            actifs_par_cat = df_vehicle_kpi_dash['Catégorie'].value_counts().to_dict()
+            
+            categories_detail = []
+            for cat in df_vehicules['Catégorie'].unique():
+                total_cat = len(df_vehicules[df_vehicules['Catégorie'] == cat])
+                actifs_cat = actifs_par_cat.get(cat, 0)
+                inactifs_cat = total_cat - actifs_cat
+                
+                categories_detail.append({
+                    'Catégorie': cat,
+                    'Total': total_cat,
+                    'Actifs': actifs_cat,
+                    'Inactifs': inactifs_cat,
+                    'Taux Activité (%)': (actifs_cat / total_cat * 100) if total_cat > 0 else 0
+                })
+            
+            categories_df = pd.DataFrame(categories_detail)
+            categories_df['Taux Activité (%)'] = categories_df['Taux Activité (%)'].round(1)
+            
+            st.dataframe(categories_df, use_container_width=True)
+        
+        # Top véhicules par distance parcourue, volume, coût
+        if not df_vehicle_kpi_dash.empty:
+            st.subheader("Top 10 des Véhicules")
+            
+            col_top1, col_top2 = st.columns(2)
+            
+            with col_top1:
+                # Top distance
+                top_dist = df_vehicle_kpi_dash.sort_values('distance', ascending=False).head(10)
+                fig_top_dist = px.bar(
+                    top_dist,
+                    x='Nouveau Immat',
+                    y='distance',
+                    title="Top 10 - Distance Parcourue",
+                    color='Catégorie',
+                    labels={'distance': 'Distance (km)'}
+                )
+                st.plotly_chart(fig_top_dist, use_container_width=True)
+            
+            with col_top2:
+                # Top volume/coût
+                top_vol = df_vehicle_kpi_dash.sort_values('total_litres', ascending=False).head(10)
+                fig_top_vol = px.bar(
+                    top_vol,
+                    x='Nouveau Immat',
+                    y=['total_litres', 'total_cout'],
+                    title="Top 10 - Volume & Coût",
+                    barmode='group',
+                    labels={
+                        'value': 'Valeur',
+                        'variable': 'Métrique'
+                    }
+                )
+                st.plotly_chart(fig_top_vol, use_container_width=True)
+        
+        # Véhicules sans géolocalisation
+        if df_geoloc is not None and not df_geoloc.empty:
+            with st.expander("⚠️ Véhicules Sans Données de Géolocalisation", expanded=False):
+                with st.spinner("Analyse des véhicules sans géolocalisation..."):
+                    df_vehicules_sans_geoloc_dash = analyser_vehicules_sans_geoloc(
+                        df_transactions, df_vehicules, df_geoloc, date_debut, date_fin
+                    )
+                
+                if df_vehicules_sans_geoloc_dash.empty:
+                    st.success("✅ Tous les véhicules avec des transactions ont des données de géolocalisation.")
+                else:
+                    nb_vehicules_sans_geoloc = len(df_vehicules_sans_geoloc_dash)
+                    st.warning(f"⚠️ {nb_vehicules_sans_geoloc} véhicules ont effectué des transactions sans données de géolocalisation correspondantes.")
+                    
+                    # Afficher un résumé simplifié
+                    df_resume = df_vehicules_sans_geoloc_dash[['Immatriculation', 'Catégorie', 'Nb_Transactions', 'Volume_Total_L']]
+                    st.dataframe(df_resume.head(5), use_container_width=True)
+                    
+                    if nb_vehicules_sans_geoloc > 5:
+                        st.info(f"👉 *{nb_vehicules_sans_geoloc - 5} autres véhicules non affichés. Consultez la page 'Géolocalisation' > onglet 'Véhicules Sans Géoloc' pour tous les détails.*")
 
 def afficher_page_anomalies(
     df_transactions: pd.DataFrame, 
