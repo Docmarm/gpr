@@ -30,24 +30,37 @@ DEFAULT_HEURE_FIN_NON_OUVRE = 6
 DEFAULT_DELTA_MINUTES_FACTURATION_DOUBLE = 60
 DEFAULT_SEUIL_ANOMALIES_SUSPECTES_SCORE = 10 # Basé sur un score pondéré
 
+# --- Seuils de consommation par défaut par catégorie (L/100km) ---
+DEFAULT_SEUILS_PAR_CATEGORIE = {
+    'BUS': 20.0,
+    'Berline': 11.0,
+    'Camion': 40.0,
+    'Chariot': 40.0,
+    'Fourgonnette': 14.0,
+    'Mini-bus': 20.0,
+    'Pick-up': 13.5,
+    'Station Wagon': 14.0,
+    'Tracteur': 40.0
+}
+
 # --- Poids par défaut pour le score de risque ---
 DEFAULT_POIDS_CONSO_EXCESSIVE = 5
-DEFAULT_POIDS_DEPASSEMENT_CAPACITE = 10
+DEFAULT_POIDS_DEPASSEMENT_CAPACITE = 15
 DEFAULT_POIDS_PRISES_RAPPROCHEES = 3
-DEFAULT_POIDS_KM_DECROISSANT = 8
+DEFAULT_POIDS_KM_DECROISSANT = 6
 DEFAULT_POIDS_KM_INCHANGE = 2
-DEFAULT_POIDS_KM_SAUT = 6
-DEFAULT_POIDS_HORS_HORAIRE = 2
+DEFAULT_POIDS_KM_SAUT = 5
+DEFAULT_POIDS_HORS_HORAIRE = 1
 DEFAULT_POIDS_HORS_SERVICE = 9
 DEFAULT_POIDS_FACT_DOUBLE = 7
 DEFAULT_POIDS_ANOMALIE_GEO = 10 # Nouveau poids pour anomalie géographique
 
 # --- Nouveaux poids pour anomalies de géolocalisation ---
-DEFAULT_POIDS_TRAJET_HORS_HEURES = 6
-DEFAULT_POIDS_TRAJET_WEEKEND = 5
-DEFAULT_POIDS_ARRETS_FREQUENTS = 4
-DEFAULT_POIDS_DETOUR_SUSPECT = 7
-DEFAULT_POIDS_TRANSACTION_SANS_PRESENCE = 9
+DEFAULT_POIDS_TRAJET_HORS_HEURES = 0
+DEFAULT_POIDS_TRAJET_WEEKEND = 2
+DEFAULT_POIDS_ARRETS_FREQUENTS = 0
+DEFAULT_POIDS_DETOUR_SUSPECT = 0
+DEFAULT_POIDS_TRANSACTION_SANS_PRESENCE = 0
 DEFAULT_POIDS_VITESSE_EXCESSIVE = 8
 
 # --- Valeurs par défaut pour les paramètres de géolocalisation ---
@@ -108,12 +121,17 @@ def initialize_session_state(df_vehicules: Optional[pd.DataFrame] = None):
     # Initialisation dynamique des seuils de conso par catégorie
     if df_vehicules is not None and not st.session_state['ss_conso_seuils_par_categorie']:
         all_cats = sorted(df_vehicules['Catégorie'].dropna().astype(str).unique())
-        st.session_state['ss_conso_seuils_par_categorie'] = {cat: DEFAULT_CONSO_SEUIL for cat in all_cats}
+        st.session_state['ss_conso_seuils_par_categorie'] = {
+            cat: DEFAULT_SEUILS_PAR_CATEGORIE.get(cat, DEFAULT_CONSO_SEUIL) for cat in all_cats
+        }
     elif df_vehicules is not None:
         # S'assurer que toutes les catégories actuelles ont un seuil
         all_cats = sorted(df_vehicules['Catégorie'].dropna().astype(str).unique())
         current_seuils = st.session_state['ss_conso_seuils_par_categorie']
-        updated_seuils = {cat: current_seuils.get(cat, DEFAULT_CONSO_SEUIL) for cat in all_cats}
+        updated_seuils = {
+            cat: current_seuils.get(cat, DEFAULT_SEUILS_PAR_CATEGORIE.get(cat, DEFAULT_CONSO_SEUIL)) 
+            for cat in all_cats
+        }
         st.session_state['ss_conso_seuils_par_categorie'] = updated_seuils
 # ---------------------------------------------------------------------
 # Fonctions de calcul de score spécifiques à la géolocalisation
@@ -7728,13 +7746,16 @@ def afficher_page_parametres(df_vehicules: Optional[pd.DataFrame] = None):
                     with cols[col_idx % 3]:
                          new_seuils[cat] = st.number_input(
                              f"Seuil {cat}",min_value=5.0, max_value=100.0,
-                             value=float(current_seuils.get(cat, DEFAULT_CONSO_SEUIL)),
+                             value=float(current_seuils.get(cat, DEFAULT_SEUILS_PAR_CATEGORIE.get(cat, DEFAULT_CONSO_SEUIL))),
                              step=0.5, format="%.1f",key=f"param_seuil_conso_{cat}"
                          )
                     col_idx += 1
                 st.session_state.ss_conso_seuils_par_categorie = new_seuils
             else:
                 st.info("Chargez les données pour définir les seuils par catégorie.")
+                st.markdown("**Seuils par défaut configurés :**")
+                for cat, seuil in DEFAULT_SEUILS_PAR_CATEGORIE.items():
+                    st.text(f"• {cat}: {seuil} L/100km")
                 st.number_input("Seuil Consommation par Défaut (utilisé si catégorie non définie)", value=DEFAULT_CONSO_SEUIL, disabled=True)
 
         with st.expander("Poids des Anomalies de Transaction pour Score de Risque"):
