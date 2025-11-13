@@ -180,29 +180,185 @@ def charger_donnees(fichier_transactions, fichier_cartes) -> Tuple[Optional[pd.D
     """Charge et nettoie les données des fichiers CSV et Excel."""
     df_transactions, df_vehicules, df_ge, df_autres = None, None, None, None
 
-    # --- Chargement Transactions ---
+    # --- Chargement Transactions (compatible CSV ou Excel Report) ---
     try:
+        # Essayer de lire comme CSV (ancien comportement)
         df_transactions = pd.read_csv(fichier_transactions, sep=';', encoding='utf-8', low_memory=False)
-        if 'Amount eur' in df_transactions.columns and 'Amount' not in df_transactions.columns:
-             df_transactions.rename(columns={'Amount eur': 'Amount'}, inplace=True)
-        if 'Place' not in df_transactions.columns and 'Place name' in df_transactions.columns:
-             df_transactions.rename(columns={'Place name': 'Place'}, inplace=True)
-    except Exception as e:
-        st.error(f"Erreur lors de la lecture du fichier de transactions : {e}")
-        return None, None, None, None
+    except Exception as e_csv:
+        # Si échec, tenter de lire comme Excel (certains exports sont des xlsx mal renommés)
+        try:
+            # Tenter la feuille 'Report' si elle existe, sinon prendre la 1ère feuille
+            try:
+                xls_tmp = pd.ExcelFile(fichier_transactions, engine='openpyxl')
+                if 'Report' in xls_tmp.sheet_names:
+                    df_transactions = pd.read_excel(xls_tmp, sheet_name='Report', engine='openpyxl')
+                else:
+                    df_transactions = pd.read_excel(xls_tmp, sheet_name=0, engine='openpyxl')
+            except Exception:
+                # fallback direct
+                df_transactions = pd.read_excel(fichier_transactions, engine='openpyxl')
+        except Exception as e_xl:
+            st.error(f"Erreur lors de la lecture du fichier de transactions (ni CSV ni Excel lisible) : {e_csv} / {e_xl}")
+            return None, None, None, None
 
-    # --- Chargement Cartes ---
+    # ---- Normalisation des noms de colonnes (adapter le nouveau format) ----
+    # Dictionnaire de renommage : clés = colonnes trouvées dans le nouveau fichier, valeurs = colonnes attendues par l'app
+    rename_map = {
+        'Date de transaction': 'Date',
+        'Heure de la transaction': 'Hour',
+        'Numéro du moyen de paiement': 'Card num.',
+        'Numéro du client': 'Client num',          # si utile
+        "Plaque d'immatriculation": 'Plate',     # optionnel
+        'Kilométrage précédent': 'Past mileage',
+        'Kilométrage actuelle': 'Current mileage',
+        'Volume': 'Quantity',
+        'Montant': 'Amount',
+        'Nom de la station': 'Place',
+        'Nom de la station ': 'Place'              # parfois espace traînantes
+    }
+
+    # Appliquer les renommages présents
+    cols_presentes = set(df_transactions.columns)
+    to_rename = {k: v for k, v in rename_map.items() if k in cols_presentes}
+    if to_rename:
+        df_transactions.rename(columns=to_rename, inplace=True)
+
+    # Quelques conversions / nettoyage compatibles avec le reste du code
+    # - Cas où la date et l'heure sont dans une seule colonne 'DateTime' : on essaie de la splitter
+    if 'DateTime' in df_transactions.columns and ('Date' not in df_transactions.columns or 'Hour' not in df_transactions.columns):
+        try:
+            dt = pd.to_datetime(df_transactions['DateTime'], errors='coerce')
+            df_transactions['Date'] = dt.dt.date
+            df_transactions['Hour'] = dt.dt.time
+        except Exception:
+            pass
+
+    # Assurer que les colonnes attendues existent (on les créera vides si absent pour éviter crash plus tard)
+    colonnes_attendues_transactions = ['Date', 'Hour', 'Card num.', 'Quantity', 'Past mileage', 'Current mileage', 'Amount', 'Place']
+    for c in colonnes_attendues_transactions:
+        if c not in df_transactions.columns:
+            df_transactions[c] = pd.NA
+
+    # Conversion types (même logique que l'app existante)
+    # si Date en format texte francais 'dd/mm/YYYY' avec repli si nécessaire
+    _date_src = df_transactions['Date']
+    _date_fmt = pd.to_datetime(_date_src, format='%d/%m/%Y', errors='coerce')
+    if _date_fmt.notna().sum() == 0:
+        _date_generic = pd.to_datetime(_date_src, dayfirst=True, errors='coerce')
+        df_transactions['Date'] = _date_generic
+    else:
+        df_transactions['Date'] = _date_fmt
+
+    # Heures — essayer HH:MM:SS puis HH:MM puis éventuellement convertir depuis string
+    _hour_src = df_transactions['Hour']
+    _hour_try1 = pd.to_datetime(_hour_src, format='%H:%M:%S', errors='coerce')
+    _hour_try2 = pd.to_datetime(_hour_src, format='%H:%M', errors='coerce')
+    _hour_generic = pd.to_datetime(_hour_src, errors='coerce')
+    _hour_parsed = _hour_try1.combine_first(_hour_try2).combine_first(_hour_generic)
     try:
-        xls = pd.ExcelFile(fichier_cartes)
-        required_sheets = {'CARTES VEHICULE', 'CARTES GE', 'AUTRES CARTES'}
-        available_sheets = set(xls.sheet_names)
-        if not required_sheets.issubset(available_sheets):
-             st.error(f"Feuilles manquantes dans le fichier Excel. Attendues: {required_sheets}. Trouvées: {available_sheets}")
-             return None, None, None, None
+        df_transactions['Hour'] = _hour_parsed.dt.time
+    except Exception:
+        df_transactions['Hour'] = _hour_src
 
-        df_vehicules = pd.read_excel(xls, sheet_name='CARTES VEHICULE')
-        df_ge = pd.read_excel(xls, sheet_name='CARTES GE')
-        df_autres = pd.read_excel(xls, sheet_name='AUTRES CARTES')
+    # Nombres : remplacer virgule décimale par point puis to_numeric
+    for col in ['Quantity', 'Past mileage', 'Current mileage', 'Amount']:
+        if col in df_transactions.columns:
+            df_transactions[col] = pd.to_numeric(df_transactions[col].astype(str).str.replace(',', '.'), errors='coerce')
+
+    # --- Chargement et normalisation : Base Parc (Cartes) ---
+    try:
+        fichier_base_cartes = fichier_cartes
+        xls = pd.ExcelFile(fichier_base_cartes, engine="openpyxl")
+        sheet_name = None
+        for candidate in ['CARTES VEHICULE', 'Cartes Vehicule', 'CARTES_VEHICULE']:
+            if candidate in xls.sheet_names:
+                sheet_name = candidate
+                break
+        if sheet_name is None:
+            sheet_name = xls.sheet_names[0]
+
+        df_cartes = pd.read_excel(fichier_base_cartes, sheet_name=sheet_name, engine="openpyxl", dtype=str)
+
+        # Normaliser noms de colonnes (strip + enlever espaces en début/fin)
+        df_cartes.columns = [c.strip() if isinstance(c, str) else c for c in df_cartes.columns]
+
+        # Mapping explicite vers les noms attendus par l'app
+        rename_map = {
+            'N° Carte': 'Card num.',
+            'N°Carte': 'Card num.',
+            'N° carte': 'Card num.',
+            'Numéro de carte': 'Card num.',
+            'Ancien Immat': 'Old_plate',
+            'Nouveau Immat': 'Plate',
+            'Exploitant-carb': 'Fuel_type',
+            'Cap-réservoir': 'Tank_capacity',
+            'Dotation': 'Allocation'
+        }
+        # Ne renommer que si la colonne existe
+        to_rename = {k: v for k, v in rename_map.items() if k in df_cartes.columns}
+        if to_rename:
+            df_cartes.rename(columns=to_rename, inplace=True)
+
+        # Nettoyage / conversion du numéro de carte : on veut une string sans .0 ni notation scientifique
+        if 'Card num.' in df_cartes.columns:
+            def clean_card_num(v):
+                if pd.isna(v):
+                    return pd.NA
+                s = str(v).strip()
+                # si Excel a donné '7.90346e+17' ou '7.903460001420434e+17' -> tenter format entier sans décimales
+                try:
+                    # tenter float -> int -> format sans décimales
+                    if 'e' in s or '.' in s:
+                        f = float(s.replace(',', '.'))
+                        return f"{int(f)}"
+                except Exception:
+                    pass
+                # retirer suffixe .0 éventuel
+                if s.endswith('.0'):
+                    s = s[:-2]
+                return s
+
+            df_cartes['Card num.'] = df_cartes['Card num.'].apply(clean_card_num)
+
+        # En option : créer un index propre pour jointures (ex : card_num_clean)
+        if 'Card num.' in df_cartes.columns:
+            df_cartes['card_num_clean'] = df_cartes['Card num.'].astype(str).str.strip().replace({'nan': pd.NA})
+
+        # Nettoyage de base pour les autres colonnes : trim et uniformiser casse
+        for c in df_cartes.columns:
+            if df_cartes[c].dtype == object:
+                df_cartes[c] = df_cartes[c].astype(str).str.strip().replace({'nan': pd.NA})
+
+        # Vérification rapide (afficher 5 premières lignes si on est en dev)
+        print("Base cartes — feuille utilisée :", sheet_name)
+        print(df_cartes[['card_num_clean','Card num.']].head(5) if 'card_num_clean' in df_cartes.columns else df_cartes.head(5))
+
+        # Intégrer avec le reste de l'application
+        df_vehicules = df_cartes
+        # Alias pour compatibilité des colonnes attendues plus loin
+        if 'N° Carte' not in df_vehicules.columns and 'Card num.' in df_vehicules.columns:
+            df_vehicules['N° Carte'] = df_vehicules['Card num.']
+        if 'Nouveau Immat' not in df_vehicules.columns and 'Plate' in df_vehicules.columns:
+            df_vehicules['Nouveau Immat'] = df_vehicules['Plate']
+        if 'Ancien Immat' not in df_vehicules.columns and 'Old_plate' in df_vehicules.columns:
+            df_vehicules['Ancien Immat'] = df_vehicules['Old_plate']
+        if 'Exploitant-carb' not in df_vehicules.columns and 'Fuel_type' in df_vehicules.columns:
+            df_vehicules['Exploitant-carb'] = df_vehicules['Fuel_type']
+        if 'Cap-rèservoir' not in df_vehicules.columns and 'Tank_capacity' in df_vehicules.columns:
+            df_vehicules['Cap-rèservoir'] = pd.to_numeric(df_vehicules['Tank_capacity'], errors='coerce')
+        if 'Dotation' not in df_vehicules.columns and 'Allocation' in df_vehicules.columns:
+            df_vehicules['Dotation'] = pd.to_numeric(df_vehicules['Allocation'], errors='coerce')
+
+        # Charger les autres feuilles si disponibles
+        df_ge, df_autres = None, None
+        if 'CARTES GE' in xls.sheet_names:
+            df_ge = pd.read_excel(xls, sheet_name='CARTES GE', dtype=str)
+        if 'AUTRES CARTES' in xls.sheet_names:
+            df_autres = pd.read_excel(xls, sheet_name='AUTRES CARTES', dtype=str)
+        if df_ge is None:
+            df_ge = pd.DataFrame(columns=['N° Carte'])
+        if df_autres is None:
+            df_autres = pd.DataFrame(columns=['N° Carte'])
     except Exception as e:
         st.error(f"Erreur lors de la lecture du fichier des cartes : {e}")
         return None, None, None, None
@@ -9133,9 +9289,10 @@ def main():
                 st.sidebar.success("✅ Données de géolocalisation chargées avec succès !")
                 st.sidebar.markdown(f"**Trajets géolocalisés :** {len(df_geoloc):,}")
                 if 'Date' in df_geoloc.columns:
-                    min_date_geo = df_geoloc['Date'].min()
-                    max_date_geo = df_geoloc['Date'].max()
-                    st.sidebar.markdown(f"**Période géoloc :** {min_date_geo.strftime('%d/%m/%Y')} - {max_date_geo.strftime('%d/%m/%Y')}")
+                    min_date_geo = df_geoloc['Date'].dropna().min()
+                    max_date_geo = df_geoloc['Date'].dropna().max()
+                    if pd.notna(min_date_geo) and pd.notna(max_date_geo):
+                        st.sidebar.markdown(f"**Période géoloc :** {min_date_geo.strftime('%d/%m/%Y')} - {max_date_geo.strftime('%d/%m/%Y')}")
 
     if df_transactions is None or df_vehicules is None or df_ge is None or df_autres is None:
         st.error("❌ Erreur lors du chargement ou de la validation des fichiers principaux. Veuillez vérifier les fichiers et les colonnes requises.")
@@ -9144,14 +9301,20 @@ def main():
 
     st.session_state['data_loaded'] = True
     st.sidebar.success("✅ Données chargées avec succès !")
-    min_date, max_date = df_transactions['Date'].min(), df_transactions['Date'].max()
+    min_date, max_date = df_transactions['Date'].dropna().min(), df_transactions['Date'].dropna().max()
     st.sidebar.markdown(f"**Transactions :** {len(df_transactions):,}")
-    st.sidebar.markdown(f"**Période :** {min_date.strftime('%d/%m/%Y')} - {max_date.strftime('%d/%m/%Y')}")
+    if pd.notna(min_date) and pd.notna(max_date):
+        st.sidebar.markdown(f"**Période :** {min_date.strftime('%d/%m/%Y')} - {max_date.strftime('%d/%m/%Y')}")
+    else:
+        st.sidebar.markdown("**Période :** N/A")
 
     initialize_session_state(df_vehicules)
 
     st.sidebar.header("2. Période d'Analyse Globale")
     col_date1, col_date2 = st.sidebar.columns(2)
+    if pd.isna(min_date) or pd.isna(max_date):
+        st.error("Aucune date valide trouvée dans les transactions.")
+        return
     global_date_debut = col_date1.date_input("Date Début", min_date.date(), min_value=min_date.date(), max_value=max_date.date(), key="global_date_debut")
     global_date_fin = col_date2.date_input("Date Fin", max_date.date(), min_value=min_date.date(), max_value=max_date.date(), key="global_date_fin")
 
