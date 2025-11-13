@@ -9274,6 +9274,8 @@ def main():
     if not fichier_transactions or not fichier_cartes:
         st.info("👋 Bienvenue ! Veuillez charger le fichier des transactions (CSV) et le fichier des cartes (Excel) via la barre latérale pour commencer.")
         initialize_session_state() 
+        if st.sidebar.radio("Navigation", ["Paramètres"], index=0, key="nav_no_data") == "Paramètres":
+            afficher_page_parametres()
         return
 
     df_transactions, df_vehicules, df_ge, df_autres = charger_donnees(fichier_transactions, fichier_cartes)
@@ -9294,89 +9296,92 @@ def main():
 
     if df_transactions is None or df_vehicules is None or df_ge is None or df_autres is None:
         st.error("❌ Erreur lors du chargement ou de la validation des fichiers principaux. Veuillez vérifier les fichiers et les colonnes requises.")
+        st.session_state['data_loaded'] = False
         return 
+
+    st.session_state['data_loaded'] = True
+    st.sidebar.success("✅ Données chargées avec succès !")
+    min_date, max_date = df_transactions['Date'].dropna().min(), df_transactions['Date'].dropna().max()
+    st.sidebar.markdown(f"**Transactions :** {len(df_transactions):,}")
+    if pd.notna(min_date) and pd.notna(max_date):
+        st.sidebar.markdown(f"**Période :** {min_date.strftime('%d/%m/%Y')} - {max_date.strftime('%d/%m/%Y')}")
+    else:
+        st.sidebar.markdown("**Période :** N/A")
+
     initialize_session_state(df_vehicules)
 
-    st.sidebar.title("APP Carburant")
-    st.sidebar.markdown("Outils : sélection, filtres et export — version classique")
+    st.sidebar.header("2. Période d'Analyse Globale")
+    col_date1, col_date2 = st.sidebar.columns(2)
+    if pd.isna(min_date) or pd.isna(max_date):
+        st.error("Aucune date valide trouvée dans les transactions.")
+        return
+    global_date_debut = col_date1.date_input("Date Début", min_date.date(), min_value=min_date.date(), max_value=max_date.date(), key="global_date_debut")
+    global_date_fin = col_date2.date_input("Date Fin", max_date.date(), min_value=min_date.date(), max_value=max_date.date(), key="global_date_fin")
 
-    if 'Date' in df_transactions.columns:
-        dates = pd.to_datetime(df_transactions['Date'], errors='coerce')
+    if global_date_debut > global_date_fin:
+        st.sidebar.error("La date de début ne peut pas être postérieure à la date de fin.")
+        return
+
+    mask_global_date = (df_transactions['Date'].dt.date >= global_date_debut) & (df_transactions['Date'].dt.date <= global_date_fin)
+    df_transac_filtered = df_transactions[mask_global_date].copy()
+
+    if df_transac_filtered.empty:
+         st.warning("Aucune transaction trouvée pour la période sélectionnée.")
     else:
-        dates = pd.Series(dtype='datetime64[ns]')
-    if dates.dropna().empty:
-        min_s = max_s = "—"
-    else:
-        min_dt = dates.min()
-        max_dt = dates.max()
-        min_s = pd.Timestamp(min_dt).strftime('%d/%m/%Y') if not pd.isna(min_dt) else "—"
-        max_s = pd.Timestamp(max_dt).strftime('%d/%m/%Y') if not pd.isna(max_dt) else "—"
-    st.sidebar.markdown(f"**Période :** {min_s} - {max_s}")
+         st.sidebar.info(f"{len(df_transac_filtered):,} transactions dans la période sélectionnée.")
 
-    with st.sidebar.expander("Filtres", expanded=True):
-        try:
-            start_date = st.date_input("Date début", value=(pd.to_datetime(min_dt).date() if not dates.dropna().empty else None))
-            end_date = st.date_input("Date fin", value=(pd.to_datetime(max_dt).date() if not dates.dropna().empty else None))
-        except Exception:
-            start_date = None
-            end_date = None
+    st.sidebar.header("3. Navigation")
+    pages = [
+        "Tableau de Bord", "Analyse Véhicules", "Analyse des Coûts", 
+        "Analyse par Période", "Suivi des Dotations", "Anomalies", "KPIs", "Autres Cartes", "Bilan Carbone"
+    ]
+    
+    # Ajouter les pages de géolocalisation et de rapports si le fichier est chargé
+    if df_geoloc is not None:
+        pages.append("Géolocalisation")
+        pages.append("Rapports PowerPoint")  # Nouvelle page
+        
+    pages.append("Paramètres")  # Toujours en dernier
+    
+    # Laisser toutes les pages accessibles même si df_transac_filtered est vide, les pages géreront l'affichage.
+    page = st.sidebar.radio("Choisir une page :", pages, key="navigation_main")
 
-        categories = sorted(df_vehicules['Catégorie'].dropna().unique().astype(str)) if df_vehicules is not None else []
-        categorie_sel = st.multiselect("Catégorie (véhicules)", options=["Tous"] + categories, default=["Tous"])
-
-        if st.sidebar.button("Recalculer / Actualiser"):
-            st.experimental_rerun()
-
-    st.header("Analyse Carburant — Version Classique")
-
-    st.subheader("Transactions brutes")
-    afficher_dataframe_avec_export(df_transactions.sort_values(by=['DateTime'] if 'DateTime' in df_transactions.columns else ['Date']), "Transactions", key="transactions_classic")
-
-    st.subheader("Cartes non référencées / inconnues")
-    df_inc = verifier_cartes_inconnues(df_transactions, df_vehicules, df_ge, df_autres)
-    if df_inc is None or isinstance(df_inc, pd.DataFrame) and df_inc.empty:
-        st.info("Aucune carte inconnue détectée.")
-    else:
-        afficher_dataframe_avec_export(df_inc, "Cartes inconnues", key="cartes_inconnues")
-
-    st.subheader("Anomalies détectées")
-    df_anomalies = detecter_anomalies(df_transactions, df_vehicules)
-    if df_anomalies is None or (isinstance(df_anomalies, pd.DataFrame) and df_anomalies.empty):
-        st.info("Aucune anomalie détectée.")
-    else:
-        afficher_dataframe_avec_export(df_anomalies, "Anomalies détectées", key="anomalies")
-        st.markdown("**Synthèse par type d'anomalie**")
-        summary_type = df_anomalies.groupby('type_anomalie').agg(Nb=('type_anomalie', 'size')).sort_values('Nb', ascending=False).reset_index()
-        st.dataframe(summary_type, use_container_width=True)
-
-    st.subheader("Stations potentiellement à risque")
-    df_stations_risque = analyser_stations_risque(df_anomalies, df_transactions) if 'analyser_stations_risque' in globals() else pd.DataFrame()
-    if df_stations_risque is None or df_stations_risque.empty:
-        st.info("Aucune station à risque identifiée ou fonction manquante.")
-    else:
-        afficher_dataframe_avec_export(df_stations_risque, "Stations à risque", key="stations_risque")
-
-    st.subheader("Graphiques")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Volumes par station (top 20)**")
-        try:
-            vols = df_transactions.groupby('Place')['Quantity'].sum().nlargest(20).reset_index()
-            fig = px.bar(vols, x='Place', y='Quantity', title='Top 20 - Volume par station')
-            st.plotly_chart(fig, use_container_width=True)
-        except Exception as e:
-            st.warning(f"Impossible d'afficher le graphique volumes par station: {e}")
-    with col2:
-        st.markdown("**Montant par carte (top 20)**")
-        try:
-            mont = df_transactions.groupby('Card num.')['Amount'].sum().nlargest(20).reset_index()
-            fig2 = px.bar(mont, x='Card num.', y='Amount', title='Top 20 - Montant par carte')
-            st.plotly_chart(fig2, use_container_width=True)
-        except Exception as e:
-            st.warning(f"Impossible d'afficher le graphique montant par carte: {e}")
-
-    st.markdown("---")
-    st.caption("Interface restaurée : présentation classique (tables + exports + graphiques simples).")
+    if page == "Tableau de Bord":
+        kpi_cat_dashboard, df_vehicle_kpi_dashboard = calculer_kpis_globaux(
+            df_transac_filtered, df_vehicules, global_date_debut, global_date_fin,
+            list(st.session_state.ss_conso_seuils_par_categorie.keys()) 
+        )
+        afficher_page_dashboard(df_transac_filtered, df_vehicules, df_ge, df_autres, global_date_debut, global_date_fin, df_geoloc)
+        ameliorer_dashboard(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin, 
+                        kpi_cat_dashboard, df_vehicle_kpi_dashboard, df_geoloc)
+    elif page == "Analyse Véhicules":
+         kpi_cat_veh_page, _ = calculer_kpis_globaux(
+             df_transac_filtered, df_vehicules, global_date_debut, global_date_fin,
+             list(st.session_state.ss_conso_seuils_par_categorie.keys()) 
+         )
+         afficher_page_analyse_vehicules(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin, kpi_cat_veh_page, df_geoloc)
+    elif page == "Analyse des Coûts":
+         afficher_page_analyse_couts(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin)
+    elif page == "Analyse par Période":
+         afficher_page_analyse_periodes(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin)
+    elif page == "Suivi des Dotations":
+         afficher_page_suivi_dotations(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin)
+    elif page == "Anomalies":
+        afficher_page_anomalies(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin, df_geoloc)
+    elif page == "KPIs":
+        afficher_page_kpi(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin)
+    elif page == "Autres Cartes":
+        afficher_page_autres_cartes(df_transac_filtered, df_autres, global_date_debut, global_date_fin)
+    elif page == "Bilan Carbone":
+        afficher_page_bilan_carbone(df_transac_filtered, df_vehicules, global_date_debut, global_date_fin)
+    elif page == "Géolocalisation" and df_geoloc is not None:
+        # Page d'analyse de géolocalisation
+        afficher_page_analyse_geolocalisation(df_geoloc, df_transac_filtered, df_vehicules, global_date_debut, global_date_fin)
+    elif page == "Rapports PowerPoint" and df_geoloc is not None:
+        # Nouvelle page pour générer des rapports PowerPoint
+        afficher_page_rapports(df_transac_filtered, df_vehicules, df_geoloc, global_date_debut, global_date_fin)
+    elif page == "Paramètres":
+        afficher_page_parametres(df_vehicules)
 
 if __name__ == "__main__":
     main()
